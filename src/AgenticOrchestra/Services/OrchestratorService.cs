@@ -8,11 +8,12 @@ namespace AgenticOrchestra.Services;
 /// Attempts to use the local Ollama instance first.
 /// If unavailable, it falls back to the Playwright web automation agent.
 /// </summary>
-public sealed class OrchestratorService
+public sealed class OrchestratorService : IAsyncDisposable
 {
     private readonly AppConfig _config;
     private readonly OllamaAgent _ollamaAgent;
     private readonly PlaywrightWebAgent _webAgent;
+    private readonly SessionLoggingService _sessionLogger;
     private readonly AgentManagerService _agentManager;
     
     private readonly List<ChatMessage> _history;
@@ -28,7 +29,8 @@ public sealed class OrchestratorService
         _config = config;
         _ollamaAgent = new OllamaAgent(config);
         _webAgent = new PlaywrightWebAgent(config);
-        _agentManager = new AgentManagerService(_webAgent);
+        _sessionLogger = new SessionLoggingService();
+        _agentManager = new AgentManagerService(_webAgent, _sessionLogger);
         _history = new List<ChatMessage>
         {
             new ChatMessage { Role = ChatRole.System, Content = config.SystemPrompt }
@@ -86,5 +88,13 @@ public sealed class OrchestratorService
     {
         _history.Clear();
         _history.Add(new ChatMessage { Role = ChatRole.System, Content = _config.SystemPrompt });
+    }
+
+    /// <summary>
+    /// Safely tears down the Orchestrator pipeline, saving sessions and closing automated browser instances.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        await _webAgent.DisposeAsync();
     }
 }
