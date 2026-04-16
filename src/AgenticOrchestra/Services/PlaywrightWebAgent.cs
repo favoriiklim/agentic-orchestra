@@ -42,7 +42,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         {
             Headless = _config.WebFallback.Headless,
             ViewportSize = new ViewportSize { Width = 1280, Height = 800 },
-            Channel = "msedge",
+            // Channel = "msedge",
             Args = new[] { "--disable-blink-features=AutomationControlled" },
             IgnoreHTTPSErrors = true
         };
