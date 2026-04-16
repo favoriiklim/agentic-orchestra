@@ -96,5 +96,6 @@ public sealed class OrchestratorService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await _webAgent.DisposeAsync();
+        await _agentManager.DisposeAsync();
     }
 }
