@@ -52,3 +52,33 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# =========================
+# PROJEYE ÖZEL EKLENTİLER
+# =========================
+
+# IDE Klasörleri ve Ayarları (VS, VS Code, Rider)
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Proje Konfigürasyonları ve API Anahtarları (BUNLAR ÇOK KRİTİK)
+config.json
+appsettings.json
+appsettings.Development.json
+appsettings.*.json
+.env
+*.secret
+
+# Playwright Web Otomasyonu Kalıntıları
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.playwright/
+
+# İşletim Sistemi Kalıntıları (Windows & Linux Arası Geçiş İçin)
+.DS_Store
+Thumbs.db
+Desktop.ini
