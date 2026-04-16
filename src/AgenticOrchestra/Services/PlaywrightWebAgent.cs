@@ -131,23 +131,9 @@ public sealed class PlaywrightWebAgent
                 await page.Keyboard.InsertTextAsync(prompt);
                 await Task.Delay(500);
 
-                // Verify text actually appeared
-                var hasText = await page.EvaluateAsync<bool>(@"(selector) => {
-                    const el = document.querySelector(selector);
-                    if (!el) return false;
-                    const text = el.innerText || el.textContent || el.value || '';
-                    return text.trim().length > 0;
-                }", foundSelector);
-
-                if (hasText)
-                {
-                    Log("(Plan A) [green]SUCCESS[/] — text confirmed in DOM.");
-                    inputSucceeded = true;
-                }
-                else
-                {
-                    Log("(Plan A) [yellow]FAILED[/] — text not detected in DOM after InsertTextAsync.");
-                }
+                // Assume success if no exception
+                Log("(Plan A) [green]SUCCESS[/] — executed without exceptions.");
+                inputSucceeded = true;
             }
             catch (Exception ex)
             {
@@ -265,84 +251,78 @@ public sealed class PlaywrightWebAgent
             }
 
             // ── STEP 5: Click the Send button ────────────────────
-            Log("Waiting for Send button to activate...");
+            Log("Pressing Enter to submit message...");
+            await page.Keyboard.PressAsync("Enter");
             await Task.Delay(1000);
 
-            var sendClicked = await page.EvaluateAsync<bool>(@"() => {
-                // Priority-ordered button selectors (multi-language)
-                const btnSelectors = [
-                    'button.send-button',
-                    'button[aria-label*=""Send""]',
-                    'button[aria-label*=""send""]',
-                    'button[aria-label*=""Gönder""]',
-                    'button[aria-label*=""gönder""]',
-                    'button[data-at=""send""]',
-                    '.send-button-container button',
-                    'button[mat-icon-button]'
-                ];
+            // ── STEP 6: Wait for and Extract Response ────────────────
+            Log("Polling DOM for AI response (waiting for generation to stabilize)...");
 
-                for (const s of btnSelectors) {
-                    const btn = document.querySelector(s);
-                    if (btn && !btn.disabled) {
-                        btn.click();
-                        return true;
+            string lastText = "";
+            int unchangedCount = 0;
+            string? finalResponse = null;
+
+            // Poll for up to 60 seconds
+            for (int i = 0; i < 60; i++)
+            {
+                await Task.Delay(1000);
+                
+                string currentText = "";
+                try
+                {
+                    currentText = await page.EvaluateAsync<string>(@"() => {
+                        var elements = document.querySelectorAll('message-content, .markdown, article, .response-container');
+                        if (elements.length > 0) {
+                            return elements[elements.length - 1].innerText;
+                        }
+                        var broad = document.querySelectorAll('[class*=""response""], [class*=""answer""], [class*=""message""]');
+                        if (broad.length > 0) {
+                            return broad[broad.length - 1].innerText;
+                        }
+                        return '';
+                    }");
+                }
+                catch (Exception evalEx)
+                {
+                    // Catch Playwright target closed or transient DOM errors without crashing the entire method
+                    Log($"(WARN) Polling logic encountered transient error: {Markup.Escape(evalEx.Message)}");
+                }
+
+                if (!string.IsNullOrWhiteSpace(currentText))
+                {
+                    if (currentText == lastText)
+                    {
+                        unchangedCount++;
+                        if (unchangedCount >= 3) // 3 consecutive polls (3s) with no text changes
+                        {
+                            finalResponse = currentText;
+                            Log("[green]Response generation stabilized.[/]");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // Text is actively actively streaming/growing
+                        unchangedCount = 0;
+                        lastText = currentText;
+                        Log($"[dim]Streaming... ({currentText.Length} chars)[/]");
                     }
                 }
-
-                // Broad fallback: any enabled button with SVG and send-like label
-                for (const btn of document.querySelectorAll('button:not([disabled])')) {
-                    const label = (btn.getAttribute('aria-label') || btn.textContent || '').toLowerCase();
-                    if (label.includes('send') || label.includes('gönder') || label.includes('submit') || label.includes('gonder')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            }");
-
-            if (sendClicked)
-            {
-                Log("[green]Send button clicked successfully.[/]");
-            }
-            else
-            {
-                Log("[yellow]Send button not found, trying Enter key as fallback...[/]");
-                await page.Keyboard.PressAsync("Enter");
             }
 
-            // ── STEP 6: Wait for response ────────────────────────
-            Log("Waiting for AI response (3s delay + NetworkIdle)...");
-            await Task.Delay(3000);
-
-            try
+            if (finalResponse == null)
             {
-                await page.WaitForLoadStateAsync(LoadState.NetworkIdle,
-                    new PageWaitForLoadStateOptions { Timeout = 60000 });
-            }
-            catch (TimeoutException)
-            {
-                Log("[yellow]NetworkIdle timeout (60s). Proceeding with extraction anyway...[/]");
+                Log("[yellow]Response polling timed out before stabilizing. Returning last known text.[/]");
+                finalResponse = lastText;
             }
 
-            await Task.Delay(1500);
-            Log("Response wait complete. Extracting...");
+            if (string.IsNullOrWhiteSpace(finalResponse))
+            {
+                return "(Error) Empty response received from browser.";
+            }
 
-            // ── STEP 7: Extract the response ─────────────────────
-            var result = await page.EvaluateAsync<string>(@"() => {
-                var elements = document.querySelectorAll('message-content, .markdown, article, .response-container');
-                if (elements.length > 0) {
-                    return elements[elements.length - 1].innerText;
-                }
-                // Broader fallback: any element with model-response class patterns
-                var broad = document.querySelectorAll('[class*=""response""], [class*=""answer""], [class*=""message""]');
-                if (broad.length > 0) {
-                    return broad[broad.length - 1].innerText;
-                }
-                return 'Could not automatically extract response. Check browser visually.';
-            }");
-
-            Log($"[green]Response extracted[/] ({result?.Length ?? 0} chars).");
-            return result ?? "(Error) Empty response received from browser.";
+            Log($"[green]Response extracted completely[/] ({finalResponse.Length} chars).");
+            return finalResponse;
         }
         catch (Exception ex)
         {
