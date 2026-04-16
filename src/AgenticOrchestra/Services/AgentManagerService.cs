@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
+using System.IO;
 using Spectre.Console;
 
 namespace AgenticOrchestra.Services;
@@ -180,17 +181,31 @@ Acknowledge these instructions and start the requested task immediately without 
                 }
             }
 
-            // 4. Parse File Writes
-            var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*([^\|]+)\|\s*(.+?)\](?=\[FILE_|\[TERMINAL|\[SPAWN|$)", RegexOptions.Singleline);
+            // 4. Parse File Writes (Executioner Pattern)
+            var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>.*?)\s*\|\s*(?<content>.*?)\]", RegexOptions.Singleline);
             foreach (Match m in writeMatches)
             {
-                var path = m.Groups[1].Value.Trim();
-                var content = m.Groups[2].Value.Trim();
-                if (content.EndsWith("]")) content = content.Substring(0, content.Length - 1).Trim();
+                var path = m.Groups["path"].Value.Trim();
+                var content = m.Groups["content"].Value.Trim();
                 
-                AnsiConsole.MarkupLine($"[dim cyan]Native Agent writing:[/] {Markup.Escape(path)}");
-                _fileService.WriteFile(path, content);
-                loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': Success.");
+                try
+                {
+                    var dir = Path.GetDirectoryName(path);
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                    File.WriteAllText(path, content);
+                    
+                    AnsiConsole.MarkupLine($"[bold green][[SUCCESS]][/] File Physically Written to: {Markup.Escape(path)}");
+                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': Success (Physical Commitment).");
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[bold red]✕ Physical Write Failed for {Markup.Escape(path)}:[/] {Markup.Escape(ex.Message)}");
+                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': FAILED - {ex.Message}");
+                }
+                
                 actionExecuted = true;
             }
 

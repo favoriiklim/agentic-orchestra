@@ -12,6 +12,7 @@ public static class ChatView
     public static async Task RunAsync(OrchestratorService orchestrator, AppConfig config)
     {
         AnsiConsole.Clear();
+        UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]Autonomous Multi-Agent Session[/]").LeftJustified());
         AnsiConsole.MarkupLine("[dim]Use [bold cyan]--help[/] to view available CLI commands.[/]");
         AnsiConsole.WriteLine();

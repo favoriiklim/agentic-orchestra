@@ -16,14 +16,7 @@ public static class Program
         try
         {
             // ── Banner ──────────────────────────────────────────────
-            AnsiConsole.Write(new FigletText("Agentic Orchestra")
-                .LeftJustified()
-                .Color(Color.CornflowerBlue));
-
-            AnsiConsole.Write(new Rule("[dim]Hybrid AI Orchestrator — Local LLM · Web Fallback[/]")
-                .RuleStyle(Style.Parse("grey"))
-                .LeftJustified());
-            AnsiConsole.WriteLine();
+            UIHelper.RenderBanner();
 
             // ── Load Configuration ──────────────────────────────────
             bool isFirstRun = !File.Exists(ConfigService.ConfigFilePath);

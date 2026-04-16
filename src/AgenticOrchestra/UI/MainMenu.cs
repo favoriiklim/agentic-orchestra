@@ -13,6 +13,7 @@ public static class MainMenu
         while (true)
         {
             AnsiConsole.Clear();
+            UIHelper.RenderBanner();
             
             AnsiConsole.Write(new Rule("[dim]Main Menu[/]").LeftJustified());
             AnsiConsole.MarkupLine($"Current Default Model: [green]{config.Ollama.Model}[/]");
@@ -54,6 +55,7 @@ public static class MainMenu
     private static async Task ShowStatusAsync(AppConfig config, OrchestratorService orchestrator)
     {
         AnsiConsole.Clear();
+        UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]System Status[/]").LeftJustified());
 
         var isLocalUp = await AnsiConsole.Status()

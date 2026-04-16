@@ -9,6 +9,7 @@ public static class ConfigMenu
     public static async Task RunAsync(AppConfig config, ConfigService configService)
     {
         AnsiConsole.Clear();
+        UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]Settings[/]").LeftJustified());
 
         // 1. Ollama Endpoint
