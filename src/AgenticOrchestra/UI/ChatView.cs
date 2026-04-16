@@ -38,14 +38,7 @@ public static class ChatView
 
             string response = string.Empty;
             
-            await AnsiConsole.Status()
-                .SpinnerStyle(Style.Parse("magenta"))
-                .StartAsync($"Agent is thinking ([dim]{orchestrator.ActiveProviderName}[/])...", async ctx =>
-                {
-                    response = await orchestrator.ProcessPromptAsync(prompt);
-                    // Update the status message in case it fell back during the call
-                    ctx.Status($"Agent is thinking ([dim]{orchestrator.ActiveProviderName}[/])...");
-                });
+            response = await orchestrator.ProcessPromptAsync(prompt);
 
             var panel = new Panel(new Markup(Markup.Escape(response)))
             {

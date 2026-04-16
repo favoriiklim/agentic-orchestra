@@ -1,4 +1,5 @@
 using AgenticOrchestra.Models;
+using Spectre.Console;
 
 namespace AgenticOrchestra.Services;
 
@@ -12,6 +13,7 @@ public sealed class OrchestratorService
     private readonly AppConfig _config;
     private readonly OllamaAgent _ollamaAgent;
     private readonly PlaywrightWebAgent _webAgent;
+    private readonly AgentManagerService _agentManager;
     
     private readonly List<ChatMessage> _history;
 
@@ -26,6 +28,7 @@ public sealed class OrchestratorService
         _config = config;
         _ollamaAgent = new OllamaAgent(config);
         _webAgent = new PlaywrightWebAgent(config);
+        _agentManager = new AgentManagerService(_webAgent);
         _history = new List<ChatMessage>
         {
             new ChatMessage { Role = ChatRole.System, Content = config.SystemPrompt }
@@ -48,23 +51,26 @@ public sealed class OrchestratorService
         // 1. Add user prompt to history
         _history.Add(new ChatMessage { Role = ChatRole.User, Content = prompt });
 
-        string responseText;
+        string responseText = string.Empty;
 
         // 2. Fallback Logic Pipeline
         IsUsingLocalAgent = await _ollamaAgent.IsAvailableAsync();
 
         if (IsUsingLocalAgent)
         {
-            // Path A: Local execution via Ollama
-            responseText = await _ollamaAgent.SendPromptAsync(_history);
+            // Path A: Local execution via Ollama (Basic visual status)
+            await AnsiConsole.Status()
+                .SpinnerStyle(Style.Parse("magenta"))
+                .StartAsync($"Agent is thinking ([dim]{ActiveProviderName}[/])...", async ctx =>
+                {
+                    responseText = await _ollamaAgent.SendPromptAsync(_history);
+                });
         }
         else
         {
-            // Path B: Fallback to Browser automation
-            // Note: History is not perfectly maintained in the browser fallback MVP
-            // since the web session implicitly maintains its own state in the thread.
-            // We just send the latest prompt to keep it simple.
-            responseText = await _webAgent.SendPromptAsync(prompt);
+            // Path B: Fallback to Multi-Agent Browser orchestration
+            await _agentManager.InitializeAsync();
+            responseText = await _agentManager.ProcessUserInputAsync(prompt);
         }
 
         // 3. Append response to history

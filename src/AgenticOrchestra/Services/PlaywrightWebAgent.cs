@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Playwright;
 using AgenticOrchestra.Models;
 using Spectre.Console;
@@ -5,18 +6,17 @@ using Spectre.Console;
 namespace AgenticOrchestra.Services;
 
 /// <summary>
-/// Fallback AI agent that uses browser automation to interact with a web-based AI platform.
-/// Uses Playwright's persistent context to retain login sessions.
-/// Features aggressive multi-strategy input injection with deep debug logging.
+/// Stateful Web Agent capable of managing multiple Agent Tabs/Personas in a single browser context.
 /// </summary>
-public sealed class PlaywrightWebAgent
+public sealed class PlaywrightWebAgent : IAsyncDisposable
 {
     private readonly AppConfig _config;
+    private IPlaywright? _playwright;
+    private IBrowserContext? _context;
+    
+    // Tracks specific tabs dedicated to specific Agent Roles
+    private readonly ConcurrentDictionary<string, IPage> _tabs = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>
-    /// Path where debug screenshots are saved on failure.
-    /// Uses the cross-platform AppData folder.
-    /// </summary>
     private static string DebugScreenshotDir =>
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -28,13 +28,15 @@ public sealed class PlaywrightWebAgent
     }
 
     /// <summary>
-    /// Launches the browser, navigates to the target URL, submits the prompt,
-    /// and attempts to extract the response.
+    /// Initializes the long-running Playwright browser context.
+    /// MUST be called once before sending messages.
     /// </summary>
-    public async Task<string> SendPromptAsync(string prompt)
+    public async Task InitializeAsync()
     {
-        Log("Initializing Playwright...");
-        using var playwright = await Playwright.CreateAsync();
+        if (_playwright != null) return;
+
+        Log("Initializing Playwright Engine...");
+        _playwright = await Playwright.CreateAsync();
 
         var launchOptions = new BrowserTypeLaunchPersistentContextOptions
         {
@@ -46,26 +48,51 @@ public sealed class PlaywrightWebAgent
         };
 
         var profilePath = ConfigService.BrowserProfilePath;
-        Log($"Browser profile: {profilePath}");
-        Log($"Channel: msedge | Headless: {_config.WebFallback.Headless}");
+        Log($"Mounting persistent context at: {profilePath}");
+        _context = await _playwright.Chromium.LaunchPersistentContextAsync(profilePath, launchOptions);
+    }
 
-        Log("Launching persistent browser context...");
-        await using var context = await playwright.Chromium.LaunchPersistentContextAsync(profilePath, launchOptions);
+    /// <summary>
+    /// Gets an existing page for the agent, or spawns a new one and navigates to the AI platform.
+    /// </summary>
+    private async Task<IPage> GetOrCreateTabAsync(string agentName)
+    {
+        if (_context == null) throw new InvalidOperationException("PlaywrightWebAgent is not initialized.");
 
-        var page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+        if (_tabs.TryGetValue(agentName, out var existingPage))
+        {
+            await existingPage.BringToFrontAsync();
+            return existingPage;
+        }
 
+        Log($"Spawning new isolated tab for agent: [cyan]{Markup.Escape(agentName)}[/]");
+        
+        // Use the initial blank page if it's the very first tab, otherwise open a new one.
+        var newPage = _tabs.IsEmpty ? (_context.Pages.FirstOrDefault() ?? await _context.NewPageAsync()) : await _context.NewPageAsync();
+
+        Log($"Navigating [cyan]{Markup.Escape(agentName)}[/] to {_config.WebFallback.TargetUrl}...");
+        await newPage.GotoAsync(_config.WebFallback.TargetUrl, new PageGotoOptions
+        {
+            WaitUntil = WaitUntilState.DOMContentLoaded,
+            Timeout = 60000
+        });
+        
+        Log($"Navigation complete for [cyan]{Markup.Escape(agentName)}[/].");
+        _tabs[agentName] = newPage;
+        return newPage;
+    }
+
+    /// <summary>
+    /// Sends a prompt to the specifically named agent tab and extracts the response.
+    /// </summary>
+    public async Task<string> SendMessageAsync(string agentName, string prompt)
+    {
         try
         {
-            // ── STEP 1: Navigate ─────────────────────────────────
-            Log($"Navigating to {_config.WebFallback.TargetUrl}...");
-            await page.GotoAsync(_config.WebFallback.TargetUrl, new PageGotoOptions
-            {
-                WaitUntil = WaitUntilState.DOMContentLoaded
-            });
-            Log("Navigation complete (DOMContentLoaded reached). Relying on DOM polling next.");
+            var page = await GetOrCreateTabAsync(agentName);
 
-            // ── STEP 2: Wait for input element to exist ──────────
-            Log("Polling DOM for input element...");
+            // ── STEP 1: Wait for input element to exist ──────────
+            Log($"({Markup.Escape(agentName)}) Polling DOM for input element...");
             string? foundSelector = null;
 
             try
@@ -82,7 +109,6 @@ public sealed class PlaywrightWebAgent
                         'textarea[placeholder]'
                     ];
 
-                    // Poll up to 30 seconds (60 iterations × 500ms)
                     for (let i = 0; i < 60; i++) {
                         for (const s of selectors) {
                             const el = document.querySelector(s);
@@ -102,161 +128,33 @@ public sealed class PlaywrightWebAgent
 
             if (string.IsNullOrEmpty(foundSelector))
             {
-                await SaveDebugScreenshot(page, "no_input_element");
-                return "(Error) Input element not found after 30s polling. Debug screenshot saved. " +
-                       "Set Headless=false in Settings and log in manually.";
+                await SaveDebugScreenshot(page, $"no_input_element_{agentName}");
+                return "(Error) Input element not found. Set Headless=false to check manually.";
             }
 
-            Log($"Input element found via selector: [cyan]{Markup.Escape(foundSelector)}[/]");
-
-            // Extra delay for framework event listener hydration
             await Task.Delay(1500);
 
-            // ── STEP 3: Focus the element ────────────────────────
-            Log("Focusing input element...");
+            // ── STEP 2: Focus the element ────────────────────────
             await page.EvaluateAsync(@"(selector) => {
                 const el = document.querySelector(selector);
                 if (el) { el.focus(); el.click(); }
             }", foundSelector);
             await Task.Delay(300);
-            Log("Focus applied.");
 
-            // ── STEP 4: Attempt input via 3 strategies ───────────
-            bool inputSucceeded = false;
+            // ── STEP 3: Insert Text ──────────────────────────────
+            Log($"({Markup.Escape(agentName)}) Injecting prompt...");
+            await page.Keyboard.InsertTextAsync(prompt);
+            await Task.Delay(500);
 
-            // ──── Plan A: InsertTextAsync (real textInput event) ──
-            Log("(Plan A) Attempting page.Keyboard.InsertTextAsync...");
-            try
-            {
-                await page.Keyboard.InsertTextAsync(prompt);
-                await Task.Delay(500);
-
-                // Assume success if no exception
-                Log("(Plan A) [green]SUCCESS[/] — executed without exceptions.");
-                inputSucceeded = true;
-            }
-            catch (Exception ex)
-            {
-                Log($"(Plan A) [red]EXCEPTION[/]: {Markup.Escape(ex.Message)}");
-            }
-
-            // ──── Plan B: Clipboard Paste (Ctrl+V) ──────────────
-            if (!inputSucceeded)
-            {
-                Log("(Plan B) Attempting clipboard paste (Ctrl+V)...");
-                try
-                {
-                    // Clear any existing content first
-                    await page.Keyboard.PressAsync("Control+A");
-                    await Task.Delay(100);
-                    await page.Keyboard.PressAsync("Backspace");
-                    await Task.Delay(100);
-
-                    // Write prompt to clipboard via JS
-                    await page.EvaluateAsync(@"(text) => navigator.clipboard.writeText(text)", prompt);
-                    await Task.Delay(200);
-
-                    // Paste
-                    await page.Keyboard.PressAsync("Control+V");
-                    await Task.Delay(500);
-
-                    // Verify
-                    var hasText = await page.EvaluateAsync<bool>(@"(selector) => {
-                        const el = document.querySelector(selector);
-                        if (!el) return false;
-                        const text = el.innerText || el.textContent || el.value || '';
-                        return text.trim().length > 0;
-                    }", foundSelector);
-
-                    if (hasText)
-                    {
-                        Log("(Plan B) [green]SUCCESS[/] — text confirmed via clipboard paste.");
-                        inputSucceeded = true;
-                    }
-                    else
-                    {
-                        Log("(Plan B) [yellow]FAILED[/] — clipboard paste did not register.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"(Plan B) [red]EXCEPTION[/]: {Markup.Escape(ex.Message)}");
-                }
-            }
-
-            // ──── Plan C: Direct JS injection + synthetic events ─
-            if (!inputSucceeded)
-            {
-                Log("(Plan C) Attempting direct JS injection with event dispatch...");
-                try
-                {
-                    var jsResult = await page.EvaluateAsync<bool>(@"(args) => {
-                        const selector = args.selector;
-                        const promptText = args.prompt;
-                        const el = document.querySelector(selector);
-                        if (!el) return false;
-
-                        el.focus();
-
-                        // Set content based on element type
-                        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-                            const setter = Object.getOwnPropertyDescriptor(
-                                window.HTMLTextAreaElement.prototype, 'value')?.set
-                                || Object.getOwnPropertyDescriptor(
-                                    window.HTMLInputElement.prototype, 'value')?.set;
-                            if (setter) setter.call(el, promptText);
-                            else el.value = promptText;
-                        } else {
-                            // contenteditable element
-                            el.innerHTML = '';
-                            el.textContent = promptText;
-                            if (!el.textContent) el.innerHTML = '<p>' + promptText + '</p>';
-                        }
-
-                        // Fire every event framework might listen to
-                        ['input','change','keydown','keyup','keypress','compositionstart','compositionend'].forEach(evtName => {
-                            el.dispatchEvent(new Event(evtName, { bubbles: true, cancelable: true }));
-                        });
-                        el.dispatchEvent(new InputEvent('input', {
-                            bubbles: true, cancelable: true,
-                            inputType: 'insertText', data: promptText
-                        }));
-
-                        return true;
-                    }", new { selector = foundSelector, prompt = prompt });
-
-                    if (jsResult)
-                    {
-                        Log("(Plan C) [green]JS injection executed.[/] Checking DOM...");
-                        await Task.Delay(500);
-                        inputSucceeded = true; // Best effort — JS ran without error
-                    }
-                    else
-                    {
-                        Log("(Plan C) [yellow]FAILED[/] — JS could not find element.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"(Plan C) [red]EXCEPTION[/]: {Markup.Escape(ex.Message)}");
-                }
-            }
-
-            // ──── All plans exhausted ────────────────────────────
-            if (!inputSucceeded)
-            {
-                await SaveDebugScreenshot(page, "all_input_plans_failed");
-                return "(Error) All 3 input strategies failed. Debug screenshot saved. " +
-                       "Check the screenshot at: " + DebugScreenshotDir;
-            }
-
-            // ── STEP 5: Click the Send button ────────────────────
-            Log("Pressing Enter to submit message...");
+            // ── STEP 4: Submit the Message ───────────────────────
+            Log($"({Markup.Escape(agentName)}) Pressing Enter to invoke...");
             await page.Keyboard.PressAsync("Enter");
-            await Task.Delay(1000);
 
-            // ── STEP 6: Wait for and Extract Response ────────────────
-            Log("Polling DOM for AI response (waiting for generation to stabilize)...");
+            // Wait a moment for UI transition
+            await Task.Delay(1500);
+
+            // ── STEP 5: Wait for and Extract Response ────────────
+            Log($"({Markup.Escape(agentName)}) Polling DOM for AI response generation...");
 
             string lastText = "";
             int unchangedCount = 0;
@@ -267,6 +165,21 @@ public sealed class PlaywrightWebAgent
             {
                 await Task.Delay(1000);
                 
+                // Enhanced Generation Sensing: Check if the 'Stop' button is visible natively
+                bool isActivelyGenerating = false;
+                try
+                {
+                    isActivelyGenerating = await page.EvaluateAsync<bool>(@"() => {
+                        const stopBtns = document.querySelectorAll('button[aria-label*=""Stop""], button[aria-label*=""Durdur""]');
+                        for (const btn of stopBtns) {
+                            // If any stop button has physical dimensions, we are generating
+                            if (btn.offsetWidth > 0 || btn.offsetHeight > 0) return true;
+                        }
+                        return false;
+                    }");
+                }
+                catch { /* Ignore transient errors in UI sensing */ }
+
                 string currentText = "";
                 try
                 {
@@ -284,59 +197,71 @@ public sealed class PlaywrightWebAgent
                 }
                 catch (Exception evalEx)
                 {
-                    // Catch Playwright target closed or transient DOM errors without crashing the entire method
-                    Log($"(WARN) Polling logic encountered transient error: {Markup.Escape(evalEx.Message)}");
+                    Log($"(WARN) Polling logic transient error: {Markup.Escape(evalEx.Message)}");
                 }
 
                 if (!string.IsNullOrWhiteSpace(currentText))
                 {
-                    if (currentText == lastText)
+                    // It is stable if it hasn't changed AND the UI 'Stop' button is not visible
+                    if (currentText == lastText && !isActivelyGenerating)
                     {
                         unchangedCount++;
-                        if (unchangedCount >= 3) // 3 consecutive polls (3s) with no text changes
+                        if (unchangedCount >= 3)
                         {
                             finalResponse = currentText;
-                            Log("[green]Response generation stabilized.[/]");
+                            Log($"[green]({Markup.Escape(agentName)}) Response generation stabilized.[/]");
                             break;
                         }
                     }
                     else
                     {
-                        // Text is actively actively streaming/growing
                         unchangedCount = 0;
                         lastText = currentText;
-                        Log($"[dim]Streaming... ({currentText.Length} chars)[/]");
+                        Log($"[dim]({Markup.Escape(agentName)}) Typing... ({currentText.Length} chars)[/]");
                     }
+                }
+                // If it's still blank but 'Stop' is visible, just patient.
+                else if (isActivelyGenerating)
+                {
+                    Log($"[dim]({Markup.Escape(agentName)}) Thinking (UI generating)...[/]");
                 }
             }
 
             if (finalResponse == null)
             {
-                Log("[yellow]Response polling timed out before stabilizing. Returning last known text.[/]");
+                Log($"[yellow]({Markup.Escape(agentName)}) Response timed out. Returning last known text.[/]");
                 finalResponse = lastText;
             }
 
             if (string.IsNullOrWhiteSpace(finalResponse))
             {
-                return "(Error) Empty response received from browser.";
+                return $"(Error) Empty response received from {agentName}.";
             }
 
-            Log($"[green]Response extracted completely[/] ({finalResponse.Length} chars).");
             return finalResponse;
         }
         catch (Exception ex)
         {
-            Log($"[red]CRITICAL EXCEPTION[/]: {Markup.Escape(ex.Message)}");
-            await SaveDebugScreenshot(page, "critical_exception");
-            return $"[WebAgent Error] {ex.Message}\nDebug screenshot saved to: {DebugScreenshotDir}";
+            Log($"[red]CRITICAL EXCEPTION on {Markup.Escape(agentName)}[/]: {Markup.Escape(ex.Message)}");
+            return $"[WebAgent Error] {ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// Safely shuts down the browser context and Playwright instance.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_context != null)
+        {
+            await _context.CloseAsync();
+            await _context.DisposeAsync();
+        }
+        _playwright?.Dispose();
     }
 
     // ── Helpers ──────────────────────────────────────────────────
 
-    /// <summary>
-    /// Saves a debug screenshot to the debug directory with a timestamp.
-    /// </summary>
     private static async Task SaveDebugScreenshot(IPage page, string label)
     {
         try
@@ -353,9 +278,6 @@ public sealed class PlaywrightWebAgent
         }
     }
 
-    /// <summary>
-    /// Logs a debug message to the console via Spectre.Console markup.
-    /// </summary>
     private static void Log(string message)
     {
         AnsiConsole.MarkupLine($"[dim]WebAgent>[/] {message}");
