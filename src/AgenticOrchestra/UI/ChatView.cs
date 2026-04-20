@@ -1,3 +1,4 @@
+using System.Text;
 using Spectre.Console;
 using AgenticOrchestra.Models;
 using AgenticOrchestra.Services;
@@ -14,9 +15,7 @@ public static class ChatView
         AnsiConsole.Clear();
         UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]Autonomous Multi-Agent Session[/]").LeftJustified());
-        AnsiConsole.MarkupLine("[dim]Use [bold cyan]--help[/] to view available CLI commands.[/]");
-        AnsiConsole.WriteLine();
-
+        
         while (true)
         {
             var prompt = AnsiConsole.Prompt(
@@ -30,21 +29,22 @@ public static class ChatView
             // ── Command Parser ──
             if (prompt.StartsWith("--"))
             {
-                if (prompt.Trim().Equals("--exit", StringComparison.OrdinalIgnoreCase))
+                var cmd = prompt.Trim().ToLower();
+
+                if (cmd == "--exit")
                 {
                     AnsiConsole.MarkupLine("[dim]Gracefully safely tearing down the Head Manager and background workers...[/]");
                     await orchestrator.DisposeAsync();
                     Environment.Exit(0);
                 }
 
-                if (prompt.Trim().Equals("--back", StringComparison.OrdinalIgnoreCase) || prompt.Trim().Equals("--menu", StringComparison.OrdinalIgnoreCase))
+                if (cmd == "--back" || cmd == "--menu")
                 {
-                    // Breaking returns to MainMenu.cs. The Playwright Orchestrator context remains alive in the background!
                     AnsiConsole.MarkupLine("[dim italic]Returning to Main Menu. Background orchestration contexts remain alive.[/]");
                     break; 
                 }
 
-                if (prompt.Trim().Equals("--clear", StringComparison.OrdinalIgnoreCase))
+                if (cmd == "--clear")
                 {
                     orchestrator.ClearHistory();
                     AnsiConsole.MarkupLine("[dim italic]Conversation history cleared.[/]");
@@ -52,41 +52,51 @@ public static class ChatView
                     continue;
                 }
 
-                if (prompt.Trim().Equals("--help", StringComparison.OrdinalIgnoreCase))
+                if (cmd == "--dream" || cmd == "--dreaming")
+                {
+                    // Manually trigger the dreaming sequence
+                    prompt = "[SYSTEM_DREAMING_TRIGGER]";
+                }
+                else if (cmd == "--help")
                 {
                     DrawHelpMenu();
                     continue;
                 }
-
-                AnsiConsole.MarkupLine($"[red]Unknown command '{Markup.Escape(prompt)}'. Use [bold]--help[/] for a list of valid commands.[/]");
-                continue;
+                else 
+                {
+                    AnsiConsole.MarkupLine($"[red]Unknown command '{Markup.Escape(prompt)}'. Use [bold]--help[/] for a list of valid commands.[/]");
+                    continue;
+                }
             }
 
-            string response = string.Empty;
-            
-            // Core Fallback Pipeline Execution
-            response = await orchestrator.ProcessPromptAsync(prompt);
-
-            var panel = new Panel(new Markup(Markup.Escape(response)))
+            if (prompt == "[SYSTEM_DREAMING_TRIGGER]" || !prompt.StartsWith("--"))
             {
-                Border = BoxBorder.Rounded,
-                Padding = new Padding(1, 1, 1, 1),
-                Header = new PanelHeader($" {orchestrator.ActiveProviderName} ", Justify.Left)
-            };
+                string response = string.Empty;
+                
+                // Core Fallback Pipeline Execution
+                response = await orchestrator.ProcessPromptAsync(prompt);
 
-            // Differentiate colors based on backend provider gracefully
-            if (orchestrator.IsUsingLocalAgent)
-            {
-                panel.BorderColor(Color.Cyan1);
+                var panel = new Panel(new Markup(Markup.Escape(response)))
+                {
+                    Border = BoxBorder.Rounded,
+                    Padding = new Padding(1, 1, 1, 1),
+                    Header = new PanelHeader($" {orchestrator.ActiveProviderName} ", Justify.Left)
+                };
+
+                // Differentiate colors based on backend provider gracefully
+                if (orchestrator.IsUsingLocalAgent)
+                {
+                    panel.BorderColor(Color.Cyan1);
+                }
+                else
+                {
+                    panel.BorderColor(Color.Fuchsia);
+                }
+
+                AnsiConsole.WriteLine();
+                AnsiConsole.Write(panel);
+                AnsiConsole.WriteLine();
             }
-            else
-            {
-                panel.BorderColor(Color.Fuchsia);
-            }
-
-            AnsiConsole.WriteLine();
-            AnsiConsole.Write(panel);
-            AnsiConsole.WriteLine();
         }
     }
 
@@ -99,6 +109,7 @@ public static class ChatView
 
         table.AddRow("[bold]--help[/]", "Display this help menu and check agent statuses.");
         table.AddRow("[bold]--clear[/]", "Clear the active conversation history (Ollama only).");
+        table.AddRow("[bold]--dream[/]", "Manually trigger 'Dreaming' mode to analyze project state.");
         table.AddRow("[bold]--back[/] / [bold]--menu[/]", "Return to the main menu. Background agents remain alive.");
         table.AddRow("[bold]--exit[/]", "Terminate all agent websessions, save state, and exit app.");
 

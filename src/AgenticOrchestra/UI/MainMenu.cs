@@ -26,7 +26,8 @@ public static class MainMenu
                     .PageSize(10)
                     .AddChoices(new[]
                     {
-                        "🤖 Start Chat",
+                        "🤖 Start New Chat",
+                        "📂 Load Session",
                         "⚙️ Settings",
                         "📊 System Status",
                         "🚪 Exit"
@@ -34,8 +35,11 @@ public static class MainMenu
 
             switch (choice)
             {
-                case "🤖 Start Chat":
+                case "🤖 Start New Chat":
                     await ChatView.RunAsync(orchestrator, config);
+                    break;
+                case "📂 Load Session":
+                    await HandleLoadSessionAsync(orchestrator, config);
                     break;
                 case "⚙️ Settings":
                     await ConfigMenu.RunAsync(config, configService);
@@ -50,6 +54,35 @@ public static class MainMenu
                     return;
             }
         }
+    }
+
+    private static async Task HandleLoadSessionAsync(OrchestratorService orchestrator, AppConfig config)
+    {
+        var sessionLogger = new SessionLoggingService();
+        var files = sessionLogger.GetAvailableSessions();
+
+        if (files.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[yellow]No previous sessions found.[/]");
+            Console.ReadLine();
+            return;
+        }
+
+        var loadChoice = AnsiConsole.Prompt(
+            new SelectionPrompt<FileInfo>()
+                .Title("Select a session to load:")
+                .PageSize(10)
+                .AddChoices(files)
+                .UseConverter(f => $"{f.CreationTime:g} - {f.Name}")
+        );
+
+        var loadedSession = await sessionLogger.LoadSessionAsync(loadChoice.FullName);
+        orchestrator.LoadState(loadedSession);
+        
+        AnsiConsole.MarkupLine($"[green]Loaded session with {loadedSession.Operations.Count} operations and {loadedSession.RawHistory.Count} history turns.[/]");
+        await Task.Delay(1500);
+
+        await ChatView.RunAsync(orchestrator, config);
     }
 
     private static async Task ShowStatusAsync(AppConfig config, OrchestratorService orchestrator)

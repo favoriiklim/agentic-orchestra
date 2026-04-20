@@ -11,8 +11,13 @@ namespace AgenticOrchestra.Services;
 public sealed class SessionLoggingService
 {
     private readonly string _sessionDir;
-    private readonly string _sessionFilePath;
     private SessionData _currentSession;
+    private string CurrentSessionFilePath => Path.Combine(_sessionDir, $"{_currentSession.Id}.json");
+
+    /// <summary>
+    /// For backward compatibility with existing agent manager initialization.
+    /// </summary>
+    public Task InitializeAsync() => Task.CompletedTask;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -26,30 +31,43 @@ public sealed class SessionLoggingService
         _sessionDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "AgenticOrchestra", "sessions");
-        _sessionFilePath = Path.Combine(_sessionDir, "latest_session.json");
         _currentSession = new SessionData();
+        Directory.CreateDirectory(_sessionDir);
     }
 
     /// <summary>
-    /// Loads the past session from disk if it exists.
+    /// Loads a specific session file from disk and maps it into memory.
     /// </summary>
-    public async Task InitializeAsync()
+    public async Task<SessionData> LoadSessionAsync(string filePath)
     {
-        Directory.CreateDirectory(_sessionDir);
-        if (File.Exists(_sessionFilePath))
+        if (File.Exists(filePath))
         {
             try
             {
-                var json = await File.ReadAllTextAsync(_sessionFilePath);
+                var json = await File.ReadAllTextAsync(filePath);
                 _currentSession = JsonSerializer.Deserialize<SessionData>(json, JsonOptions) ?? new SessionData();
             }
             catch
             {
-                // If corrupted, just overwrite with a fresh session
                 _currentSession = new SessionData();
             }
         }
+        return _currentSession;
     }
+
+    /// <summary>
+    /// Returns a list of all saved session files, ordered newest first.
+    /// </summary>
+    public List<FileInfo> GetAvailableSessions()
+    {
+        Directory.CreateDirectory(_sessionDir);
+        var dirInfo = new DirectoryInfo(_sessionDir);
+        return dirInfo.GetFiles("session_*.json")
+                      .OrderByDescending(f => f.CreationTimeUtc)
+                      .ToList();
+    }
+
+    public SessionData GetCurrentSession() => _currentSession;
 
     /// <summary>
     /// Logs a complete interaction and asynchronously saves it to disk.
@@ -67,6 +85,16 @@ public sealed class SessionLoggingService
     }
 
     /// <summary>
+    /// Syncs the raw conversational history into the persistent session.
+    /// </summary>
+    public async Task UpdateRawHistoryAsync(List<ChatMessage> history)
+    {
+        // Deep copy the list so we aren't tied to the reference
+        _currentSession.RawHistory = history.Select(h => new ChatMessage { Role = h.Role, Content = h.Content }).ToList();
+        await SaveSessionAsync();
+    }
+
+    /// <summary>
     /// Updates the global high-level summary of the project state.
     /// </summary>
     public async Task UpdateProjectStateAsync(string newSummary)
@@ -78,7 +106,7 @@ public sealed class SessionLoggingService
     private async Task SaveSessionAsync()
     {
         var json = JsonSerializer.Serialize(_currentSession, JsonOptions);
-        await File.WriteAllTextAsync(_sessionFilePath, json);
+        await File.WriteAllTextAsync(CurrentSessionFilePath, json);
     }
 
     /// <summary>

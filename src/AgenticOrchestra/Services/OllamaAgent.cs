@@ -79,7 +79,14 @@ public sealed class OllamaAgent
         };
 
         var response = await _httpClient.PostAsJsonAsync("/api/chat", requestBody);
-        response.EnsureSuccessStatusCode();
+        
+        // --- DEĞİŞTİRİLEN KISIM: 500 Hatasının Detayını Görmek İçin ---
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorText = await response.Content.ReadAsStringAsync();
+            throw new Exception($"Ollama API Error ({(int)response.StatusCode}): {errorText}");
+        }
+        // --------------------------------------------------------------
 
         var responseData = await response.Content.ReadFromJsonAsync<OllamaChatResponse>();
         

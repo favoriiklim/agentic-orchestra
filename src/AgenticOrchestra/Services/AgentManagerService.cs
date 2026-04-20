@@ -13,8 +13,7 @@ public sealed class AgentManagerService : IAsyncDisposable
 {
     private readonly PlaywrightWebAgent _webAgent;
     private readonly SessionLoggingService _sessionLogger;
-    private readonly NativeFileService _fileService;
-    private readonly NativeTerminalService _terminalService;
+    private readonly ToolExecutionService _toolExecution;
     
     private bool _managerIdentityInitialized = false;
     private int _consecutiveFailures = 0;
@@ -22,12 +21,11 @@ public sealed class AgentManagerService : IAsyncDisposable
 
     private readonly string[] _delegationKeywords = { "agent", "worker", "expert", "team", "swarm", "ekip", "ajan" };
 
-    public AgentManagerService(PlaywrightWebAgent webAgent, SessionLoggingService sessionLogger)
+    public AgentManagerService(PlaywrightWebAgent webAgent, SessionLoggingService sessionLogger, ToolExecutionService toolExecution)
     {
         _webAgent = webAgent;
         _sessionLogger = sessionLogger;
-        _fileService = new NativeFileService();
-        _terminalService = new NativeTerminalService();
+        _toolExecution = toolExecution;
     }
 
     public async Task InitializeAsync()
@@ -54,17 +52,16 @@ YOUR ARSENAL (You MUST use these exact formats to interact with the world):
 1. [TERMINAL_EXEC: command] -> Executes PowerShell/CMD commands on the host. Use this to create folders, run scripts, or check system status.
 2. [FILE_READ: filepath] -> Reads the content of a physical file into your context.
 3. [FILE_WRITE: filepath | content] -> Writes or overwrites physical files on the disk.
-4. [SPAWN: AgentName | Persona & Task] -> Opens a new physical browser tab, creating a sub-agent to research or code parallel tasks. You must use this when a project requires multiple experts.
+4. [SPAWN: AgentName | Persona & Task] -> Opens a new physical browser tab, creating a sub-agent to research or code parallel tasks.
 
-THE ABSOLUTE LAWS:
-1. NEVER apologize or claim you cannot access the system. You access it by outputting the tokens above.
-2. NEVER ask for permission to start. If the user gives a project, immediately start the Scan-Plan-Execute cycle.
-3. If a terminal command fails, analyze the error and retry autonomously (up to 5 times) using different commands or fixing the code.
-4. Assume the host is a Windows machine using PowerShell unless told otherwise.
+THE ABSOLUTE LAWS (CRITICAL BEHAVIORAL CONSTRAINTS):
+1. NO SIMULATIONS: You are physically connected to a C# middleware. DO NOT simulate, guess, or fake the terminal output. 
+2. NO MARKDOWN: DO NOT write markdown code blocks (e.g., ```bash or ```powershell). You MUST strictly use the exact bracket format.
+3. WAIT FOR MIDDLEWARE: Just output the command tag and stop generating text. The middleware will execute it and reply in the next turn with the real 'System Outcomes'.
+4. NEVER apologize or claim you cannot access the system.
+5. Assume the host is a Windows machine using PowerShell unless told otherwise.
 
-{memoryContext}
-
-Acknowledge these instructions and start the requested task immediately without further conversational preamble.";
+{memoryContext}";
 
         await AnsiConsole.Status()
             .SpinnerStyle(Style.Parse("blue"))
@@ -136,77 +133,17 @@ Acknowledge these instructions and start the requested task immediately without 
                 }
             }
 
-            // 2. Parse File Reads
-            var readMatches = Regex.Matches(aiResponse, @"\[FILE_READ:\s*([^\]]+)\]");
-            foreach (Match m in readMatches)
+            // 2. Process Shared Physical Tools (File Read, Terminal, File Write)
+            var toolResult = await _toolExecution.ExecuteToolsAsync(aiResponse);
+            if (toolResult.ActionsExecuted)
             {
-                var path = m.Groups[1].Value.Trim();
-                AnsiConsole.MarkupLine($"[dim cyan]Native Agent reading:[/] {Markup.Escape(path)}");
-                var content = _fileService.ReadFile(path);
-                loopFeedBuilder.AppendLine($"Result of FILE_READ '{path}':\n```\n{content}\n```\n");
                 actionExecuted = true;
-            }
-
-            // 3. Parse Terminal Commands (with Budget/Failure Tracking)
-            var termMatches = Regex.Matches(aiResponse, @"\[TERMINAL_EXEC:\s*([^\]]+)\]");
-            foreach (Match m in termMatches)
-            {
-                var cmd = m.Groups[1].Value.Trim();
-                var result = await _terminalService.ExecuteCommandAsync(cmd);
+                loopFeedBuilder.Append(toolResult.Output);
                 
-                // Heuristic error detection (Exit code or Error keywords)
-                bool isError = result.Contains("Error", StringComparison.OrdinalIgnoreCase) || 
-                               result.Contains("Failed", StringComparison.OrdinalIgnoreCase) ||
-                               result.Contains("Exception", StringComparison.OrdinalIgnoreCase);
-
-                if (isError)
+                if (toolResult.BudgetExceeded)
                 {
-                    _consecutiveFailures++;
-                    AnsiConsole.MarkupLine($"[bold red]✕ Command failed ({_consecutiveFailures}/{MaxRetryBudget}).[/]");
+                    return "ABORTED: The Head Manager reached the 5-retry limit trying to fix a persistent error.\n\n" + loopFeedBuilder.ToString();
                 }
-                else
-                {
-                    _consecutiveFailures = 0; // Reset on success
-                }
-
-                loopFeedBuilder.AppendLine($"Result of TERMINAL_EXEC '{cmd}':\n```\n{result}\n```\n");
-                actionExecuted = true;
-
-                if (_consecutiveFailures >= MaxRetryBudget)
-                {
-                    AnsiConsole.MarkupLine("[bold red]FATAL: Bug-fix budget exhausted. Halting autonomous loop.[/]");
-                    loopFeedBuilder.AppendLine("\nERROR: Bug-fix budget exceeded (5 retries). Please intervene manually.");
-                    actionExecuted = true; // Still true so we feed the failure back one last time
-                    break;
-                }
-            }
-
-            // 4. Parse File Writes (Executioner Pattern)
-            var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>.*?)\s*\|\s*(?<content>.*?)\]", RegexOptions.Singleline);
-            foreach (Match m in writeMatches)
-            {
-                var path = m.Groups["path"].Value.Trim();
-                var content = m.Groups["content"].Value.Trim();
-                
-                try
-                {
-                    var dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir))
-                    {
-                        Directory.CreateDirectory(dir);
-                    }
-                    File.WriteAllText(path, content);
-                    
-                    AnsiConsole.MarkupLine($"[bold green][[SUCCESS]][/] File Physically Written to: {Markup.Escape(path)}");
-                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': Success (Physical Commitment).");
-                }
-                catch (Exception ex)
-                {
-                    AnsiConsole.MarkupLine($"[bold red]✕ Physical Write Failed for {Markup.Escape(path)}:[/] {Markup.Escape(ex.Message)}");
-                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': FAILED - {ex.Message}");
-                }
-                
-                actionExecuted = true;
             }
 
             if (actionExecuted)
@@ -229,7 +166,6 @@ Acknowledge these instructions and start the requested task immediately without 
 
     public async ValueTask DisposeAsync()
     {
-        _terminalService.Dispose();
         await ValueTask.CompletedTask;
     }
 }
