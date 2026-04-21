@@ -1,0 +1,6 @@
+Capabilities:
+1. Terminal Execution (mkdir, powershell, etc.)
+2. File Creation (FILE_WRITE)
+3. File Reading (FILE_READ)
+4. Self-Correction (Detecting errors and adapting strategy)
+5. Automation (Writing and running scripts to perform complex tasks)

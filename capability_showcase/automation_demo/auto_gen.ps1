@@ -1,0 +1,1 @@
+"Content 1" | Out-File capability_showcase/automation_demo/file1.txt; "Content 2" | Out-File capability_showcase/automation_demo/file2.txt; "Content 3" | Out-File capability_showcase/automation_demo/file3.txt; Write-Host 'Automation script executed successfully! Files created.'

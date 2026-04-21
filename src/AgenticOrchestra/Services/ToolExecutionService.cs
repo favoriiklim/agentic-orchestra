@@ -19,6 +19,7 @@ public sealed class ToolExecutionService : IDisposable
     private readonly NativeFileService _fileService;
     private readonly NativeTerminalService _terminalService;
     private readonly HttpClient _httpClient;
+    private AgentManagerService? _agentManager; // Injected later to avoid circular dependency
     private int _consecutiveFailures = 0;
     private const int MaxRetryBudget = 5;
 
@@ -29,6 +30,14 @@ public sealed class ToolExecutionService : IDisposable
         _terminalService = new NativeTerminalService();
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+    }
+
+    /// <summary>
+    /// Late-binds the AgentManager to break circular dependency (Orchestrator -> ToolExec -> AgentManager -> ToolExec).
+    /// </summary>
+    public void SetAgentManager(AgentManagerService agentManager)
+    {
+        _agentManager = agentManager;
     }
 
     /// <summary>
@@ -44,12 +53,15 @@ public sealed class ToolExecutionService : IDisposable
 
         bool actionExecuted = false;
         var loopFeedBuilder = new StringBuilder();
+        var executedCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // Dedup guard
 
-        // 1. Parse File Reads
+        // 1. Parse File Reads (deduplicated)
         var readMatches = Regex.Matches(aiResponse, @"\[FILE_READ:\s*([^\]]+)\]");
         foreach (Match m in readMatches)
         {
             var path = m.Groups[1].Value.Trim();
+            var dedupKey = $"READ:{path}";
+            if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
             AnsiConsole.MarkupLine($"[dim cyan]Native Agent reading:[/] {Markup.Escape(path)}");
             var content = _fileService.ReadFile(path);
             loopFeedBuilder.AppendLine($"Result of FILE_READ '{path}':\n```\n{content}\n```\n");
@@ -61,6 +73,8 @@ public sealed class ToolExecutionService : IDisposable
         foreach (Match m in termMatches)
         {
             var cmd = m.Groups[1].Value.Trim();
+            var dedupKey = $"EXEC:{cmd}";
+            if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
             var result = await _terminalService.ExecuteCommandAsync(cmd);
             
             // Heuristic error detection
@@ -95,7 +109,8 @@ public sealed class ToolExecutionService : IDisposable
         {
             var path = m.Groups["path"].Value.Trim();
             var content = m.Groups["content"].Value.Trim();
-            
+            var dedupKey = $"WRITE:{path}";
+            if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
             var result = _fileService.WriteFile(path, content);
             if (result.Contains("Success"))
             {
@@ -136,6 +151,40 @@ public sealed class ToolExecutionService : IDisposable
             var workerResult = await SpawnLocalWorkerAsync(persona, taskContext);
             loopFeedBuilder.AppendLine($"Result of LOCAL_WORKER (Persona: {persona}):\n{workerResult}\n");
             
+            actionExecuted = true;
+        }
+
+        // 6. Parse Web Agent Spawning [SPAWN: AgentName | Task] (Playwright bridge)
+        var webSpawnMatches = Regex.Matches(aiResponse, @"\[SPAWN:\s*(?<name>[^\|]+)\|\s*(?<task>.+?)\]", RegexOptions.Singleline);
+        foreach (Match m in webSpawnMatches)
+        {
+            var agentName = m.Groups["name"].Value.Trim();
+            var taskInstruction = m.Groups["task"].Value.Trim();
+
+            if (_agentManager != null)
+            {
+                AnsiConsole.MarkupLine($"[bold cyan]⚡ Spawning Web Agent:[/] [dim]{Markup.Escape(agentName)}[/]");
+                
+                try
+                {
+                    await _agentManager.InitializeAsync();
+                    var webResult = await _agentManager.ProcessUserInputAsync(
+                        $"[SPAWN: {agentName} | {taskInstruction}]"
+                    );
+                    loopFeedBuilder.AppendLine($"Result of SPAWN '{agentName}':\n{webResult}\n");
+                }
+                catch (Exception ex)
+                {
+                    loopFeedBuilder.AppendLine($"Result of SPAWN '{agentName}': FAILED - {ex.Message}\n");
+                    AnsiConsole.MarkupLine($"[bold red]✕ Web Agent Spawn Failed:[/] {Markup.Escape(ex.Message)}");
+                }
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[bold yellow]⚠ SPAWN requested but Web Agent unavailable. Falling back to LOCAL_WORKER...[/]");
+                var fallbackResult = await SpawnLocalWorkerAsync(agentName, taskInstruction);
+                loopFeedBuilder.AppendLine($"Result of SPAWN->LOCAL_WORKER '{agentName}':\n{fallbackResult}\n");
+            }
             actionExecuted = true;
         }
 

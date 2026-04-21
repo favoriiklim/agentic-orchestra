@@ -34,6 +34,7 @@ public sealed class OrchestratorService : IAsyncDisposable
         _sessionLogger = new SessionLoggingService();
         _toolExecution = new ToolExecutionService(config);
         _agentManager = new AgentManagerService(_webAgent, _sessionLogger, _toolExecution);
+        _toolExecution.SetAgentManager(_agentManager); // Bridge local→web spawning
         _history = new List<ChatMessage>();
     }
 
@@ -85,48 +86,41 @@ public sealed class OrchestratorService : IAsyncDisposable
                 while (true)
                 {
                     // Path A: Local execution via Ollama
-                    await AnsiConsole.Status()
-                        .SpinnerStyle(Style.Parse("magenta"))
-                        .StartAsync($"Agent is thinking ([dim]{ActiveProviderName}[/])...", async ctx =>
-                        {
-                            // --- DYNAMIC CONTEXT INJECTION (Just-In-Time) ---
-                            string memoryContext = _sessionLogger.GetMemoryInjectionString();
-                            string systemRules = _config.SystemPrompt;
+                    // ═══════════════════════════════════════════════════════════
+                    // KV-CACHE-FRIENDLY PAYLOAD CONSTRUCTION
+                    // ═══════════════════════════════════════════════════════════
 
-                            // ── Layer 1: System Role (weak but still useful as baseline) ──
-                            var payload = new List<ChatMessage>
-                            {
-                                new ChatMessage { Role = ChatRole.System, Content = systemRules }
-                            };
+                    // ── Layer 1: STATIC System Role (cacheable) ──
+                    var payload = new List<ChatMessage>
+                    {
+                        new ChatMessage { Role = ChatRole.System, Content = _config.SystemPrompt }
+                    };
 
-                            // ── Layer 2: Few-Shot Demonstration (teaches FORMAT by example) ──
-                            // This is the most powerful technique to force strict output on local LLMs.
-                            payload.Add(new ChatMessage { Role = ChatRole.User, Content = "Mevcut dizindeki dosyaları listele." });
-                            payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "[TERMINAL_EXEC: Get-ChildItem]" });
-                            payload.Add(new ChatMessage { Role = ChatRole.User, Content = "System Outcomes:\nResult of TERMINAL_EXEC 'Get-ChildItem':\n```\nMode  LastWriteTime     Length Name\n-a--- 2026-04-20 10:00   1024 README.md\n```\n\nEvaluate results. If an error persists, fix it via [FILE_WRITE]. If done, give final response." });
-                            payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "Dizinde şu dosya bulunuyor:\n- README.md (1024 bytes)\n\nBaşka bir işlem yapmamı ister misiniz?" });
+                    // ── Layer 2: Minimal Few-Shot (2 messages only, cacheable) ──
+                    payload.Add(new ChatMessage { Role = ChatRole.User, Content = "Dizindeki dosyaları listele." });
+                    payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "[TERMINAL_EXEC: Get-ChildItem]" });
 
-                            payload.Add(new ChatMessage { Role = ChatRole.User, Content = "test.txt dosyası oluştur ve içine 'merhaba dünya' yaz." });
-                            payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "[FILE_WRITE: test.txt | merhaba dünya]" });
-                            payload.Add(new ChatMessage { Role = ChatRole.User, Content = "System Outcomes:\nResult of FILE_WRITE 'test.txt': Success (Physical Commitment).\n\nEvaluate results. If an error persists, fix it via [FILE_WRITE]. If done, give final response." });
-                            payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "test.txt dosyası başarıyla oluşturuldu ve içine 'merhaba dünya' yazıldı." });
+                    // ── Layer 3: Conversation history (dynamic tail) ──
+                    foreach (var msg in _history)
+                    {
+                        payload.Add(new ChatMessage { Role = msg.Role, Content = msg.Content });
+                    }
 
-                            // ── Layer 3: Deep-Clone actual conversation history ──
-                            // We deep-clone to avoid mutating original _history objects
-                            foreach (var msg in _history)
-                            {
-                                payload.Add(new ChatMessage { Role = msg.Role, Content = msg.Content });
-                            }
+                    // ── Layer 4: Lightweight recency reminder (no memory blob) ──
+                    var lastUserMsg = payload.Last(m => m.Role == ChatRole.User);
+                    lastUserMsg.Content = $"[RULES: Use bracket tokens only: [TERMINAL_EXEC:], [FILE_READ:], [FILE_WRITE:], [SPAWN_LOCAL_WORKER:], [WEB_SEARCH:]. NO markdown.]\n{lastUserMsg.Content}";
 
-                            // ── Layer 4: User-Role Reinforcement on last message ──
-                            // Wrap the final user message with rules reminder so it's in the model's
-                            // immediate attention window (recency bias)
-                            var lastUserMsg = payload.Last(m => m.Role == ChatRole.User);
-                            string memoryBlock = string.IsNullOrWhiteSpace(memoryContext) ? "No previous memory." : memoryContext;
-                            lastUserMsg.Content = $"[REMINDER: You MUST use [TERMINAL_EXEC: command], [FILE_READ: path], [FILE_WRITE: path | content] bracket tokens. NEVER use markdown code blocks. Output the bracket tag and STOP.]\n\n[MEMORY]: {memoryBlock}\n\n{lastUserMsg.Content}";
+                    // ── Live Streaming Display ──
+                    AnsiConsole.MarkupLine($"\n[dim]🧠 {Markup.Escape(ActiveProviderName)} generating...[/]");
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    
+                    responseText = await _ollamaAgent.SendPromptAsync(payload, token =>
+                    {
+                        Console.Write(token); // Print each token live
+                    });
 
-                            responseText = await _ollamaAgent.SendPromptAsync(payload);
-                        });
+                    Console.ResetColor();
+                    Console.WriteLine(); // Newline after streaming finishes
 
                     // ── Extract and display Thinking Process (For DeepSeek-R1 / Reasoning Models) ──
                     var thinkPattern = new Regex(@"<think>(.*?)</think>", RegexOptions.Singleline | RegexOptions.IgnoreCase);

@@ -1,13 +1,16 @@
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AgenticOrchestra.Models;
+using Spectre.Console;
 
 namespace AgenticOrchestra.Services;
 
 /// <summary>
 /// Service for interacting with a localized Ollama instance.
 /// Connects via REST API (port 11434 by default).
+/// Uses STREAMING to prevent timeout on large models and provide real-time feedback.
 /// </summary>
 public sealed class OllamaAgent
 {
@@ -20,7 +23,8 @@ public sealed class OllamaAgent
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(config.Ollama.Endpoint),
-            Timeout = TimeSpan.FromSeconds(config.Ollama.TimeoutSeconds)
+            // High timeout only as a safety net - streaming keeps the connection alive
+            Timeout = TimeSpan.FromMinutes(10)
         };
     }
 
@@ -62,9 +66,10 @@ public sealed class OllamaAgent
 
     /// <summary>
     /// Sends a prompt along with the conversation history to Ollama.
-    /// Returns the generated response string.
+    /// Uses STREAMING mode: reads tokens incrementally so the connection never times out.
+    /// The optional onToken callback is invoked for each received token fragment.
     /// </summary>
-    public async Task<string> SendPromptAsync(List<ChatMessage> history)
+    public async Task<string> SendPromptAsync(List<ChatMessage> history, Action<string>? onToken = null)
     {
         if (history == null || history.Count == 0)
         {
@@ -75,22 +80,58 @@ public sealed class OllamaAgent
         {
             model = _config.Ollama.Model,
             messages = history,
-            stream = false // We request the entire response object at once for simplicity in MVP
+            stream = true
         };
 
-        var response = await _httpClient.PostAsJsonAsync("/api/chat", requestBody);
-        
-        // --- DEĞİŞTİRİLEN KISIM: 500 Hatasının Detayını Görmek İçin ---
+        var jsonContent = new StringContent(
+            JsonSerializer.Serialize(requestBody),
+            Encoding.UTF8,
+            "application/json"
+        );
+
+        var response = await _httpClient.SendAsync(
+            new HttpRequestMessage(HttpMethod.Post, "/api/chat") { Content = jsonContent },
+            HttpCompletionOption.ResponseHeadersRead
+        );
+
         if (!response.IsSuccessStatusCode)
         {
             var errorText = await response.Content.ReadAsStringAsync();
             throw new Exception($"Ollama API Error ({(int)response.StatusCode}): {errorText}");
         }
-        // --------------------------------------------------------------
 
-        var responseData = await response.Content.ReadFromJsonAsync<OllamaChatResponse>();
-        
-        return responseData?.Message?.Content ?? string.Empty;
+        // ── Stream the response token by token ──
+        var fullResponse = new StringBuilder();
+
+        using var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream);
+
+        while (!reader.EndOfStream)
+        {
+            var line = await reader.ReadLineAsync();
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            try
+            {
+                var chunk = JsonSerializer.Deserialize<OllamaStreamChunk>(line);
+                if (chunk?.Message?.Content != null)
+                {
+                    fullResponse.Append(chunk.Message.Content);
+                    onToken?.Invoke(chunk.Message.Content); // Live callback
+                }
+
+                if (chunk?.Done == true)
+                {
+                    break;
+                }
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+
+        return fullResponse.ToString();
     }
 }
 
@@ -112,4 +153,17 @@ internal class OllamaChatResponse
 {
     [JsonPropertyName("message")]
     public ChatMessage? Message { get; set; }
+}
+
+/// <summary>
+/// Represents a single chunk in the Ollama streaming response.
+/// Each line of the NDJSON stream contains one of these.
+/// </summary>
+internal class OllamaStreamChunk
+{
+    [JsonPropertyName("message")]
+    public ChatMessage? Message { get; set; }
+
+    [JsonPropertyName("done")]
+    public bool Done { get; set; }
 }
