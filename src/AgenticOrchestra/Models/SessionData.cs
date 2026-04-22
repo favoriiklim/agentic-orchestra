@@ -5,6 +5,9 @@ namespace AgenticOrchestra.Models;
 /// </summary>
 public sealed class SessionData
 {
+    public string Id { get; set; } = $"session_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
     /// <summary>
     /// A high-level description of what the project currently holds to avoid raw context dumping.
     /// </summary>
@@ -16,16 +19,9 @@ public sealed class SessionData
     public List<AgentOperation> Operations { get; set; } = new();
 
     /// <summary>
-    /// Accumulated Compressed Telemetry JSONs from the Web Manager AI.
-    /// Used by DreamingService for sleep-mode pattern analysis.
+    /// Deep copy of the actual LLM turn history to resume context exactly. 
     /// </summary>
-    public List<ManagerTelemetry> TelemetryLog { get; set; } = new();
-
-    /// <summary>
-    /// History of dream analysis results from the DreamingService.
-    /// The most recent entry is injected into the Manager's system prompt.
-    /// </summary>
-    public List<DreamRecord> DreamLog { get; set; } = new();
+    public List<ChatMessage> RawHistory { get; set; } = new();
 }
 
 /// <summary>
