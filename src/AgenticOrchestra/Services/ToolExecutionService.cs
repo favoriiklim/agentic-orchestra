@@ -45,7 +45,7 @@ public sealed class ToolExecutionService : IDisposable
     /// and executes them physically.
     /// Also normalizes markdown code blocks into bracket format before parsing.
     /// </summary>
-    public async Task<ToolExecutionResult> ExecuteToolsAsync(string aiResponse)
+    public async Task<ToolExecutionResult> ExecuteToolsAsync(string aiResponse, ManagerTelemetry telemetry, CancellationToken ct = default)
     {
         // ── Step 0: Normalize markdown code blocks into bracket tokens ──
         // This makes the system model-agnostic: works with both bracket tokens AND markdown output
@@ -78,9 +78,7 @@ public sealed class ToolExecutionService : IDisposable
             var result = await _terminalService.ExecuteCommandAsync(cmd);
             
             // Heuristic error detection
-            bool isError = result.Contains("Error", StringComparison.OrdinalIgnoreCase) || 
-                           result.Contains("Failed", StringComparison.OrdinalIgnoreCase) ||
-                           result.Contains("Exception", StringComparison.OrdinalIgnoreCase);
+            bool isError = result.Contains("__EXITCODE__:1") || result.Contains("Error: Command timed out or was interrupted");
 
             if (isError)
             {
@@ -104,7 +102,7 @@ public sealed class ToolExecutionService : IDisposable
         }
 
         // 3. Parse File Writes
-        var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>.*?)\s*\|\s*(?<content>.*?)\]", RegexOptions.Singleline);
+        var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>[^|]+?)\|\s*(?<content>[\s\S]*?)\s*\](?=\s*\r?\n|\s*$)", RegexOptions.Singleline);
         foreach (Match m in writeMatches)
         {
             var path = m.Groups["path"].Value.Trim();
@@ -152,6 +150,22 @@ public sealed class ToolExecutionService : IDisposable
             loopFeedBuilder.AppendLine($"Result of LOCAL_WORKER (Persona: {persona}):\n{workerResult}\n");
             
             actionExecuted = true;
+        }
+
+        // 5.5 Process [SPAWN_SQUAD] — Squad Triad Deployment
+        var squadMatches = Regex.Matches(aiResponse, @"\[SPAWN_SQUAD:\s*(.+?)\]", RegexOptions.Singleline);
+        foreach (Match m in squadMatches)
+        {
+            var squadTask = m.Groups[1].Value.Trim();
+            if (squadTask.EndsWith("]")) squadTask = squadTask[..^1].Trim();
+
+            if (_agentManager != null)
+            {
+                var squadResult = await _agentManager.RunSquadProxyAsync(squadTask, telemetry, ct);
+                loopFeedBuilder.AppendLine("System Knowledge Drop (Squad Output):");
+                loopFeedBuilder.AppendLine(squadResult);
+                actionExecuted = true;
+            }
         }
 
         // 6. Parse Web Agent Spawning [SPAWN: AgentName | Task] (Playwright bridge)

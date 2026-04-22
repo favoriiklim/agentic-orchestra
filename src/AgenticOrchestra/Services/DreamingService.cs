@@ -21,6 +21,7 @@ public sealed class DreamingService
     private readonly PlaywrightWebAgent _webAgent;
     private readonly SessionLoggingService _sessionLogger;
     private readonly AppConfig _config;
+    private int _lastDreamTelemetryCount = 0;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -43,10 +44,11 @@ public sealed class DreamingService
     public async Task<bool> CheckAndDreamIfNeededAsync()
     {
         int count = _sessionLogger.GetTelemetryCount();
-        if (count >= _config.Dreaming.TelemetryThreshold)
+        if (count - _lastDreamTelemetryCount >= _config.Dreaming.TelemetryThreshold)
         {
             AnsiConsole.MarkupLine($"\n[bold mediumpurple3]💤 Telemetry threshold ({_config.Dreaming.TelemetryThreshold}) reached. Initiating Dream Cycle...[/]");
             await RunDreamCycleAsync();
+            _lastDreamTelemetryCount = _sessionLogger.GetTelemetryCount();
             return true;
         }
         return false;

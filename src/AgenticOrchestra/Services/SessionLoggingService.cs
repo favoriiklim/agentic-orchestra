@@ -15,6 +15,7 @@ public sealed class SessionLoggingService
     private readonly string _sessionFilePath;
     private readonly string _dreamDir;
     private SessionData _currentSession;
+    private readonly SemaphoreSlim _semaphore = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -40,21 +41,29 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task InitializeAsync()
     {
-        Directory.CreateDirectory(_sessionDir);
-        Directory.CreateDirectory(_dreamDir);
-
-        if (File.Exists(_sessionFilePath))
+        await _semaphore.WaitAsync();
+        try
         {
-            try
+            Directory.CreateDirectory(_sessionDir);
+            Directory.CreateDirectory(_dreamDir);
+
+            if (File.Exists(_sessionFilePath))
             {
-                var json = await File.ReadAllTextAsync(_sessionFilePath);
-                _currentSession = JsonSerializer.Deserialize<SessionData>(json, JsonOptions) ?? new SessionData();
+                try
+                {
+                    var json = await File.ReadAllTextAsync(_sessionFilePath);
+                    _currentSession = JsonSerializer.Deserialize<SessionData>(json, JsonOptions) ?? new SessionData();
+                }
+                catch
+                {
+                    // If corrupted, just overwrite with a fresh session
+                    _currentSession = new SessionData();
+                }
             }
-            catch
-            {
-                // If corrupted, just overwrite with a fresh session
-                _currentSession = new SessionData();
-            }
+        }
+        finally
+        {
+            _semaphore.Release();
         }
     }
 
@@ -63,14 +72,22 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task AddOperationAsync(string agentName, string instruction, string output)
     {
-        _currentSession.Operations.Add(new AgentOperation
+        await _semaphore.WaitAsync();
+        try
         {
-            AgentName = agentName,
-            TaskInstruction = instruction,
-            OutputResult = output
-        });
-        
-        await SaveSessionAsync();
+            _currentSession.Operations.Add(new AgentOperation
+            {
+                AgentName = agentName,
+                TaskInstruction = instruction,
+                OutputResult = output
+            });
+            
+            await SaveSessionAsync();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     // ── Telemetry Persistence (3-Layer Hierarchy) ────────────────────
@@ -81,8 +98,16 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task AddTelemetryAsync(ManagerTelemetry telemetry)
     {
-        _currentSession.TelemetryLog.Add(telemetry);
-        await SaveSessionAsync();
+        await _semaphore.WaitAsync();
+        try
+        {
+            _currentSession.TelemetryLog.Add(telemetry);
+            await SaveSessionAsync();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -90,15 +115,35 @@ public sealed class SessionLoggingService
     /// </summary>
     public List<ManagerTelemetry> GetRecentTelemetries(int count)
     {
-        return _currentSession.TelemetryLog
-            .TakeLast(count)
-            .ToList();
+        // For reads, we lock briefly to ensure the list is not modified during counting/enumerable
+        _semaphore.Wait();
+        try
+        {
+            return _currentSession.TelemetryLog
+                .TakeLast(count)
+                .ToList();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     /// <summary>
     /// Returns the total count of unanalyzed telemetries since the last dream.
     /// </summary>
-    public int GetTelemetryCount() => _currentSession.TelemetryLog.Count;
+    public int GetTelemetryCount() 
+    {
+        _semaphore.Wait();
+        try
+        {
+            return _currentSession.TelemetryLog.Count;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
 
     // ── Dream Persistence ────────────────────────────────────────────
 
@@ -107,14 +152,22 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task SaveDreamRecordAsync(DreamRecord dream)
     {
-        _currentSession.DreamLog.Add(dream);
-        await SaveSessionAsync();
+        await _semaphore.WaitAsync();
+        try
+        {
+            _currentSession.DreamLog.Add(dream);
+            await SaveSessionAsync();
 
-        // Also save as standalone file for archival
-        var dreamFileName = $"dream_{dream.DreamTimestamp:yyyyMMdd_HHmmss}.json";
-        var dreamFilePath = Path.Combine(_dreamDir, dreamFileName);
-        var dreamJson = JsonSerializer.Serialize(dream, JsonOptions);
-        await File.WriteAllTextAsync(dreamFilePath, dreamJson);
+            // Also save as standalone file for archival
+            var dreamFileName = $"dream_{dream.DreamTimestamp:yyyyMMdd_HHmmss}.json";
+            var dreamFilePath = Path.Combine(_dreamDir, dreamFileName);
+            var dreamJson = JsonSerializer.Serialize(dream, JsonOptions);
+            await File.WriteAllTextAsync(dreamFilePath, dreamJson);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -123,8 +176,16 @@ public sealed class SessionLoggingService
     /// </summary>
     public string? GetLatestDreamInsight()
     {
-        var latestDream = _currentSession.DreamLog.LastOrDefault();
-        return latestDream?.ConsolidatedInsight;
+        _semaphore.Wait();
+        try
+        {
+            var latestDream = _currentSession.DreamLog.LastOrDefault();
+            return latestDream?.ConsolidatedInsight;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -132,8 +193,16 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task UpdateProjectStateAsync(string newSummary)
     {
-        _currentSession.ProjectStateSummary = newSummary;
-        await SaveSessionAsync();
+        await _semaphore.WaitAsync();
+        try
+        {
+            _currentSession.ProjectStateSummary = newSummary;
+            await SaveSessionAsync();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     private async Task SaveSessionAsync()
@@ -149,39 +218,48 @@ public sealed class SessionLoggingService
     /// </summary>
     public string GetMemoryInjectionString()
     {
-        var stringBuilder = new System.Text.StringBuilder();
-        stringBuilder.AppendLine("### [SYSTEM MEMORY: EXISTING PROJECT STATE] ###");
-        stringBuilder.AppendLine(_currentSession.ProjectStateSummary);
-        stringBuilder.AppendLine();
-        
-        var recentOps = _currentSession.Operations.TakeLast(5).ToList();
-        if (recentOps.Count > 0)
+        _semaphore.Wait();
+        try
         {
-            stringBuilder.AppendLine("### [SYSTEM MEMORY: LAST 5 OPERATIONS] ###");
-            foreach (var op in recentOps)
-            {
-                stringBuilder.AppendLine($"[AGENT: {op.AgentName}]");
-                stringBuilder.AppendLine($"TASK: {op.TaskInstruction}");
-                stringBuilder.AppendLine($"RESULT: {op.OutputResult}");
-                stringBuilder.AppendLine("---");
-            }
-        }
-        else
-        {
-            stringBuilder.AppendLine("No preceding operations exist in the current memory bank.");
-        }
-
-        // ── Dream Insights Injection ──
-        var dreamInsight = GetLatestDreamInsight();
-        if (!string.IsNullOrWhiteSpace(dreamInsight))
-        {
+            var stringBuilder = new System.Text.StringBuilder();
+            stringBuilder.AppendLine("### [SYSTEM MEMORY: EXISTING PROJECT STATE] ###");
+            stringBuilder.AppendLine(_currentSession.ProjectStateSummary);
             stringBuilder.AppendLine();
-            stringBuilder.AppendLine("### [SYSTEM MEMORY: DREAM ANALYSIS INSIGHTS] ###");
-            stringBuilder.AppendLine("The following insights were learned from analyzing your past task execution patterns:");
-            stringBuilder.AppendLine(dreamInsight);
-        }
+            
+            var recentOps = _currentSession.Operations.TakeLast(5).ToList();
+            if (recentOps.Count > 0)
+            {
+                stringBuilder.AppendLine("### [SYSTEM MEMORY: LAST 5 OPERATIONS] ###");
+                foreach (var op in recentOps)
+                {
+                    stringBuilder.AppendLine($"[AGENT: {op.AgentName}]");
+                    stringBuilder.AppendLine($"TASK: {op.TaskInstruction}");
+                    stringBuilder.AppendLine($"RESULT: {op.OutputResult}");
+                    stringBuilder.AppendLine("---");
+                }
+            }
+            else
+            {
+                stringBuilder.AppendLine("No preceding operations exist in the current memory bank.");
+            }
 
-        return stringBuilder.ToString();
+            // ── Dream Insights Injection ──
+            var latestDream = _currentSession.DreamLog.LastOrDefault();
+            var dreamInsight = latestDream?.ConsolidatedInsight;
+            if (!string.IsNullOrWhiteSpace(dreamInsight))
+            {
+                stringBuilder.AppendLine();
+                stringBuilder.AppendLine("### [SYSTEM MEMORY: DREAM ANALYSIS INSIGHTS] ###");
+                stringBuilder.AppendLine("The following insights were learned from analyzing your past task execution patterns:");
+                stringBuilder.AppendLine(dreamInsight);
+            }
+
+            return stringBuilder.ToString();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -189,7 +267,15 @@ public sealed class SessionLoggingService
     /// </summary>
     public async Task ClearSessionAsync()
     {
-        _currentSession = new SessionData();
-        await SaveSessionAsync();
+        await _semaphore.WaitAsync();
+        try
+        {
+            _currentSession = new SessionData();
+            await SaveSessionAsync();
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 }

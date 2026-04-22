@@ -93,20 +93,7 @@ public sealed class NativeTerminalService : IDisposable
         await _lock.WaitAsync();
         try
         {
-            // ── MANDATORY APPROVAL GATE ──
-            AnsiConsole.WriteLine();
-            var confirm = AnsiConsole.Prompt(
-                new ConfirmationPrompt($"[purple](APPROVAL REQUIRED)[/] Execute: '{Markup.Escape(command)}'?")
-                {
-                    DefaultValue = false
-                }
-            );
-
-            if (!confirm)
-            {
-                AnsiConsole.MarkupLine("[dim red]Command execution rejected by user.[/]");
-                return "(System Error: The User explicitly REJECTED the command execution.)";
-            }
+            AnsiConsole.MarkupLine($"[dim yellow]Executing command...[/]");
 
             // ── SETTLING PERIOD ──
             await Task.Delay(100);
@@ -126,8 +113,8 @@ public sealed class NativeTerminalService : IDisposable
             AnsiConsole.MarkupLine($"[dim yellow]Executing command...[/]");
 
             string fullCommand = _isWindows 
-                ? $"{command} 2>&1; Write-Output '{_marker}'" 
-                : $"{command} 2>&1\necho '{_marker}'";
+                ? $"{command} 2>&1\nif ($?) {{ Write-Output '__EXITCODE__:0' }} else {{ Write-Output '__EXITCODE__:1' }}\nWrite-Output '{_marker}'" 
+                : $"{command} 2>&1\necho '__EXITCODE__:$?'\necho '{_marker}'";
 
             await _process!.StandardInput.WriteLineAsync(fullCommand);
             await _process.StandardInput.FlushAsync();

@@ -134,9 +134,18 @@ Respond ONLY with the JSON. No markdown fences, no extra text."
         try
         {
             var classificationResult = await SendPromptAsync(classificationPrompt);
+            var jsonContent = classificationResult.Trim();
+            if (jsonContent.StartsWith("```"))
+            {
+                var firstNewline = jsonContent.IndexOf('\n');
+                if (firstNewline > 0) jsonContent = jsonContent[(firstNewline + 1)..];
+                if (jsonContent.EndsWith("```"))
+                    jsonContent = jsonContent[..^3];
+                jsonContent = jsonContent.Trim();
+            }
             
             // Attempt to parse the classification JSON
-            using var doc = JsonDocument.Parse(classificationResult);
+            using var doc = JsonDocument.Parse(jsonContent);
             var category = doc.RootElement.GetProperty("category").GetString() ?? "general";
 
             if (category.Equals("simple", StringComparison.OrdinalIgnoreCase))
@@ -213,13 +222,7 @@ RULES:
     /// </summary>
     public async Task<string> RespondDirectlyAsync(string userPrompt, List<ChatMessage> history)
     {
-        // Add the current prompt to a copy of history for context
-        var messages = new List<ChatMessage>(history)
-        {
-            new ChatMessage { Role = ChatRole.User, Content = userPrompt }
-        };
-
-        return await SendPromptAsync(messages);
+        return await SendPromptAsync(history);
     }
 }
 

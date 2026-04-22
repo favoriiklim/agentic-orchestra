@@ -11,8 +11,13 @@ namespace AgenticOrchestra.UI;
 /// </summary>
 public static class ChatView
 {
+    private static bool _eventRegistered = false;
+    private static OrchestratorService? _currentOrchestrator;
+
     public static async Task RunAsync(OrchestratorService orchestrator, AppConfig config)
     {
+        _currentOrchestrator = orchestrator;
+
         AnsiConsole.Clear();
         UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]3-Layer Autonomous Session · Local Model → Web Manager AI → Squad[/]").LeftJustified());
@@ -20,11 +25,15 @@ public static class ChatView
         AnsiConsole.WriteLine();
 
         // ── Ctrl+C Handler — graceful cancellation ──────────────────
-        Console.CancelKeyPress += (sender, e) =>
+        if (!_eventRegistered)
         {
-            e.Cancel = true; // Prevent process termination
-            orchestrator.CancelCurrentTask();
-        };
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true; // Prevent process termination
+                _currentOrchestrator?.CancelCurrentTask();
+            };
+            _eventRegistered = true;
+        }
 
         while (true)
         {

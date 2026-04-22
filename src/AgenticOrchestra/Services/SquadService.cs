@@ -273,8 +273,13 @@ APPROVED after {criticRetries} review round(s).";
         }
         catch
         {
-            // If we can't parse JSON at all, default to APPROVED
-            return new SquadReviewResult { Status = "APPROVED" };
+            // If we can't parse JSON at all, default to REJECTED so the Critic has to retry
+            return new SquadReviewResult 
+            { 
+                Status = "REJECTED", 
+                Target = "Innovator", 
+                CorrectionPrompt = "Your previous output was malformed JSON. You MUST respond with exactly the requested JSON format and absolutely no other text."
+            };
         }
     }
 }

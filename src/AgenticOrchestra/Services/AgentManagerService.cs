@@ -29,11 +29,10 @@ public sealed class AgentManagerService : IAsyncDisposable
     private readonly NativeFileService _fileService;
     private readonly NativeTerminalService _terminalService;
     private readonly SquadService _squadService;
+    private readonly ToolExecutionService _toolService;
     private readonly AppConfig _config;
     
     private bool _managerIdentityInitialized = false;
-    private int _consecutiveFailures = 0;
-    private const int MaxRetryBudget = 5;
 
     public AgentManagerService(PlaywrightWebAgent webAgent, SessionLoggingService sessionLogger, AppConfig config)
     {
@@ -43,6 +42,8 @@ public sealed class AgentManagerService : IAsyncDisposable
         _fileService = new NativeFileService();
         _terminalService = new NativeTerminalService(config.Timeouts.TerminalCommandSeconds);
         _squadService = new SquadService(webAgent, sessionLogger, config);
+        _toolService = new ToolExecutionService(config);
+        _toolService.SetAgentManager(this);
     }
 
     public async Task InitializeAsync()
@@ -95,6 +96,11 @@ Layer 3: Squad Agents — A fixed triad of sub-agents you can deploy for paralle
 7. Assume the host is Windows with PowerShell unless told otherwise.
 8. You are domain-agnostic. Adapt your expertise to whatever technology stack the user needs.
 
+8. You are domain-agnostic. Adapt your expertise to whatever technology stack the user needs.
+
+=== USER CONFIGURATION SYSTEM PROMPT ===
+{_config.SystemPrompt}
+
 {memoryContext}
 
 Acknowledge your role as the Web Manager AI (Layer 2) and await task instructions.";
@@ -143,7 +149,6 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
             telemetry.FinalOutcome = "CANCELLED: Task was interrupted by the user.";
             stopwatch.Stop();
             telemetry.ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds;
-            await _webAgent.CloseAllWorkersAsync();
             return telemetry;
         }
         catch (Exception ex)
@@ -154,12 +159,15 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
             telemetry.ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds;
             return telemetry;
         }
+        finally
+        {
+            await _webAgent.CloseAllWorkersAsync();
+        }
 
         stopwatch.Stop();
         telemetry.ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds;
         telemetry.FinalOutcome = finalResponse;
 
-        await _webAgent.CloseAllWorkersAsync();
         await _sessionLogger.AddTelemetryAsync(telemetry);
 
         return telemetry;
@@ -195,12 +203,15 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
         {
             finalResponse = $"[Manager Error] {ex.Message}";
         }
+        finally
+        {
+            await _webAgent.CloseAllWorkersAsync();
+        }
 
         stopwatch.Stop();
         telemetry.ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds;
         telemetry.FinalOutcome = finalResponse;
 
-        await _webAgent.CloseAllWorkersAsync();
         await _sessionLogger.AddTelemetryAsync(telemetry);
 
         return finalResponse;
@@ -214,10 +225,14 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
     {
         string currentPrompt = initialPrompt;
         string finalResponse = "";
-        _consecutiveFailures = 0;
+        
+        _toolService.ResetBudget();
+        int totalIterations = 0;
+        const int MaxTotalIterations = 15;
 
-        while (true)
+        while (totalIterations < MaxTotalIterations)
         {
+            totalIterations++;
             ct.ThrowIfCancellationRequested();
 
             string aiResponse = "";
@@ -231,160 +246,34 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
             await _sessionLogger.AddOperationAsync("Manager", currentPrompt, aiResponse);
             finalResponse = aiResponse;
 
-            bool actionExecuted = false;
-            var loopFeedBuilder = new System.Text.StringBuilder();
+            var result = await _toolService.ExecuteToolsAsync(aiResponse, telemetry, ct);
 
-            // ── 1. Process [SPAWN_SQUAD] — Squad Triad Deployment ───
-            var squadMatches = Regex.Matches(aiResponse, @"\[SPAWN_SQUAD:\s*(.+?)\]", RegexOptions.Singleline);
-            if (squadMatches.Count > 0)
+            if (result.BudgetExceeded)
             {
-                foreach (Match m in squadMatches)
-                {
-                    var squadTask = m.Groups[1].Value.Trim();
-                    if (squadTask.EndsWith("]")) squadTask = squadTask[..^1].Trim();
-
-                    var squadResult = await _squadService.RunSquadAsync(squadTask, telemetry, ct);
-                    loopFeedBuilder.AppendLine("System Knowledge Drop (Squad Output):");
-                    loopFeedBuilder.AppendLine(squadResult);
-                    actionExecuted = true;
-                }
+                return "ABORTED: Bug-fix budget exhausted.\n\n" + result.Output;
             }
 
-            // ── 2. Process legacy [SPAWN] — Single worker (backward compat) ─
-            var spawnMatches = Regex.Matches(aiResponse, @"\[SPAWN:\s*([^\|]+)\|\s*(.+?)\]", RegexOptions.Singleline);
-            if (spawnMatches.Count > 0 && squadMatches.Count == 0) // Only if no squad was triggered
+            if (result.ActionsExecuted)
             {
-                AnsiConsole.MarkupLine($"\n[bold cyan]⚡ Manager spawning {spawnMatches.Count} Worker Agent(s) (Layer 3)...[/]");
-                loopFeedBuilder.AppendLine("System Knowledge Drop (Worker Output):");
-
-                foreach (Match m in spawnMatches)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    var workerName = m.Groups[1].Value.Trim();
-                    var taskInstruction = m.Groups[2].Value.Trim();
-                    if (taskInstruction.EndsWith("]")) taskInstruction = taskInstruction[..^1].Trim();
-
-                    telemetry.WorkersSpawned.Add(workerName);
-                    var workerReport = new WorkerReport { WorkerName = workerName, Task = taskInstruction };
-
-                    string workerResponse = "";
-                    try
-                    {
-                        await AnsiConsole.Status()
-                            .SpinnerStyle(Style.Parse("yellow"))
-                            .StartAsync($"({workerName}) Working on task...", async ctx =>
-                            {
-                                workerResponse = await _webAgent.SendMessageAsync(workerName, taskInstruction, ct);
-                            });
-
-                        await _sessionLogger.AddOperationAsync(workerName, taskInstruction, workerResponse);
-                        AnsiConsole.MarkupLine($"[green]✓ {Markup.Escape(workerName)} completed. Reporting to Manager.[/]");
-                        workerReport.Result = workerResponse;
-                        workerReport.Status = "success";
-                    }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception ex)
-                    {
-                        workerResponse = $"(Worker Error: {ex.Message})";
-                        workerReport.Result = workerResponse;
-                        workerReport.Status = "error";
-                        AnsiConsole.MarkupLine($"[red]✕ {Markup.Escape(workerName)} failed:[/] {Markup.Escape(ex.Message)}");
-                    }
-
-                    telemetry.WorkerReports.Add(workerReport);
-                    loopFeedBuilder.AppendLine($"\n--- OUTPUT FROM {workerName.ToUpper()} ---\n{workerResponse}");
-                    await _webAgent.CloseWorkerTabAsync(workerName);
-                    actionExecuted = true;
-                }
-            }
-
-            // ── 3. Process [FILE_READ] ──────────────────────────────
-            var readMatches = Regex.Matches(aiResponse, @"\[FILE_READ:\s*([^\]]+)\]");
-            foreach (Match m in readMatches)
-            {
-                var path = m.Groups[1].Value.Trim();
-                AnsiConsole.MarkupLine($"[dim cyan]Native Agent reading:[/] {Markup.Escape(path)}");
-                var content = _fileService.ReadFile(path);
-                loopFeedBuilder.AppendLine($"Result of FILE_READ '{path}':\n```\n{content}\n```\n");
-                actionExecuted = true;
-            }
-
-            // ── 4. Process [TERMINAL_EXEC] (with Budget Tracking) ───
-            var termMatches = Regex.Matches(aiResponse, @"\[TERMINAL_EXEC:\s*([^\]]+)\]");
-            foreach (Match m in termMatches)
-            {
-                ct.ThrowIfCancellationRequested();
-                var cmd = m.Groups[1].Value.Trim();
-                var result = await _terminalService.ExecuteCommandAsync(cmd);
-                
-                bool isError = result.Contains("Error", StringComparison.OrdinalIgnoreCase) || 
-                               result.Contains("Failed", StringComparison.OrdinalIgnoreCase) ||
-                               result.Contains("Exception", StringComparison.OrdinalIgnoreCase);
-
-                if (isError)
-                {
-                    _consecutiveFailures++;
-                    telemetry.RetryCount = _consecutiveFailures;
-                    AnsiConsole.MarkupLine($"[bold red]✕ Command failed ({_consecutiveFailures}/{MaxRetryBudget}).[/]");
-                }
-                else
-                {
-                    _consecutiveFailures = 0;
-                }
-
-                loopFeedBuilder.AppendLine($"Result of TERMINAL_EXEC '{cmd}':\n```\n{result}\n```\n");
-                actionExecuted = true;
-
-                if (_consecutiveFailures >= MaxRetryBudget)
-                {
-                    AnsiConsole.MarkupLine("[bold red]FATAL: Bug-fix budget exhausted. Halting autonomous loop.[/]");
-                    telemetry.ErrorsHandled = $"Bug-fix budget exhausted after {MaxRetryBudget} consecutive failures.";
-                    loopFeedBuilder.AppendLine("\nERROR: Bug-fix budget exceeded (5 retries). Please intervene manually.");
-                    break;
-                }
-            }
-
-            // ── 5. Process [FILE_WRITE] (Executioner Pattern) ───────
-            var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>.*?)\s*\|\s*(?<content>.*?)\]", RegexOptions.Singleline);
-            foreach (Match m in writeMatches)
-            {
-                var path = m.Groups["path"].Value.Trim();
-                var content = m.Groups["content"].Value.Trim();
-                
-                try
-                {
-                    var dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                    File.WriteAllText(path, content);
-                    
-                    AnsiConsole.MarkupLine($"[bold green][[SUCCESS]][/] File Written: {Markup.Escape(path)}");
-                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': Success.");
-                }
-                catch (Exception ex)
-                {
-                    AnsiConsole.MarkupLine($"[bold red]✕ Write Failed for {Markup.Escape(path)}:[/] {Markup.Escape(ex.Message)}");
-                    loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': FAILED - {ex.Message}");
-                }
-                
-                actionExecuted = true;
-            }
-
-            // ── Loop Decision ───────────────────────────────────────
-            if (actionExecuted)
-            {
-                if (_consecutiveFailures >= MaxRetryBudget)
-                {
-                    return "ABORTED: Bug-fix budget exhausted.\n\n" + loopFeedBuilder.ToString();
-                }
-
-                currentPrompt = "System Outcomes:\n" + loopFeedBuilder.ToString() + "\nEvaluate results. If an error persists, fix it. If done, give final response.";
+                currentPrompt = "System Outcomes:\n" + result.Output + "\nEvaluate results. If an error persists, fix it. If done, give final response.";
                 continue; 
             }
 
-            break;
+            break; // No actions executed, exit loop
+        }
+
+        if (totalIterations >= MaxTotalIterations)
+        {
+            AnsiConsole.MarkupLine("[bold yellow]Loop Iteration Limit Reached (15). Halting to prevent infinite loop.[/]");
+            finalResponse += "\n[ABORTED: Max loop iterations reached]";
         }
 
         return finalResponse;
+    }
+
+    public async Task<string> RunSquadProxyAsync(string taskString, ManagerTelemetry telemetry, CancellationToken ct)
+    {
+        return await _squadService.RunSquadAsync(taskString, telemetry, ct);
     }
 
     public async ValueTask DisposeAsync()

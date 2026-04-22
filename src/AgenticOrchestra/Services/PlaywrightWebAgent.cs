@@ -85,7 +85,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
                 });
             ");
         }
-        catch (PlaywrightException)
+        catch (PlaywrightException ex)
         {
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[bold red]🔥 FATAL ERROR: Playwright Browser Profile is Locked![/]");
@@ -97,7 +97,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
             AnsiConsole.MarkupLine("3. Restart Agentic Orchestra.");
             AnsiConsole.WriteLine();
             
-            Environment.Exit(1);
+            throw new InvalidOperationException("Playwright Browser Profile is Locked. Please close zombie Chromium processes.", ex);
         }
     }
 
@@ -224,9 +224,12 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         if (_agentPlatforms.TryGetValue(agentName, out var assigned))
             return assigned;
 
-        // Default: find the platform matching TargetUrl, or first enabled
-        return _config.Platforms.FirstOrDefault(p => p.Url == _config.WebFallback.TargetUrl && p.Enabled)
-            ?? _config.Platforms.FirstOrDefault(p => p.Enabled)
+        // Default: find the platform matching TargetUrl, among all platforms (enabled OR disabled)
+        var matchedPlatform = _config.Platforms.FirstOrDefault(p => p.Url == _config.WebFallback.TargetUrl);
+        if (matchedPlatform != null)
+            return matchedPlatform;
+
+        return _config.Platforms.FirstOrDefault(p => p.Enabled)
             ?? AiPlatformConfig.Defaults()[0]; // Ultimate fallback: Gemini
     }
 
@@ -401,7 +404,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         await Task.Delay(500, ct);
 
         // Try hitting generic send buttons first, fallback to Enter/Ctrl+Enter
-        await page.EvaluateAsync(@"() => {
+        bool sendButtonClicked = await page.EvaluateAsync<bool>(@"() => {
             const btns = document.querySelectorAll('button');
             const validLabels = ['send message', 'send', 'mesajı gönder', 'gönder'];
             for(const b of btns) {
@@ -410,16 +413,20 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
                 const title = (b.getAttribute('title') || '').toLowerCase().trim();
                 
                 if (validLabels.includes(label) || validLabels.includes(title) || testid === 'send-button') {
-                    if (b.offsetWidth > 0 || b.offsetHeight > 0 && !b.disabled) {
+                    if ((b.offsetWidth > 0 || b.offsetHeight > 0) && !b.disabled) {
                         b.click();
-                        return;
+                        return true;
                     }
                 }
             }
+            return false;
         }").WaitAsync(TimeSpan.FromSeconds(5), ct);
 
         await Task.Delay(200, ct);
-        await page.Keyboard.PressAsync("Enter").WaitAsync(TimeSpan.FromSeconds(2), ct);
+        if (!sendButtonClicked)
+        {
+            await page.Keyboard.PressAsync("Enter").WaitAsync(TimeSpan.FromSeconds(2), ct);
+        }
 
         // ── STEP 3: Poll for Response (Platform-Aware) ──────────────
         Log($"({Markup.Escape(agentName)}) Polling {platform.Name} for response...");
