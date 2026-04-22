@@ -61,13 +61,44 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         {
             Headless = _config.WebFallback.Headless,
             ViewportSize = new ViewportSize { Width = 1280, Height = 800 },
-            Args = new[] { "--disable-blink-features=AutomationControlled" },
+            Args = new[] 
+            { 
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            },
+            IgnoreDefaultArgs = new[] { "--enable-automation" },
             IgnoreHTTPSErrors = true
         };
 
         var profilePath = ConfigService.BrowserProfilePath;
         Log($"Mounting persistent context at: {profilePath}");
-        _context = await _playwright.Chromium.LaunchPersistentContextAsync(profilePath, launchOptions);
+
+        try
+        {
+            _context = await _playwright.Chromium.LaunchPersistentContextAsync(profilePath, launchOptions);
+
+            // Inject script to spoof WebDriver to bypass modern bot protection
+            await _context.AddInitScriptAsync(@"
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            ");
+        }
+        catch (PlaywrightException)
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold red]🔥 FATAL ERROR: Playwright Browser Profile is Locked![/]");
+            AnsiConsole.MarkupLine($"[yellow]A background or 'zombie' Chromium process is preventing the application from mounting the profile at:[/]\n[dim]{profilePath}[/]");
+            AnsiConsole.MarkupLine("\n[cyan]How to fix this:[/]");
+            AnsiConsole.MarkupLine("1. Close any hidden or stuck Chrome/Chromium browser windows.");
+            AnsiConsole.MarkupLine("2. Or run the following command to forcefully clear them:");
+            AnsiConsole.MarkupLine("   [bold]taskkill /f /im chrome.exe[/]");
+            AnsiConsole.MarkupLine("3. Restart Agentic Orchestra.");
+            AnsiConsole.WriteLine();
+            
+            Environment.Exit(1);
+        }
     }
 
     /// <summary>
@@ -120,17 +151,46 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
             targetUrl = platform.Url;
         }
 
+        // Ephemeral web chat mode for ChatGPT
+        if (_config.WebFallback.EphemeralWebChat && targetUrl.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!targetUrl.Contains("temporary-chat=true"))
+            {
+                targetUrl += targetUrl.Contains('?') ? "&temporary-chat=true" : "?temporary-chat=true";
+            }
+        }
+
         Log($"Spawning tab for [cyan]{Markup.Escape(agentName)}[/] → {targetUrl}");
         
         var newPage = _tabs.IsEmpty 
             ? (_context.Pages.FirstOrDefault() ?? await _context.NewPageAsync()) 
             : await _context.NewPageAsync();
 
-        await newPage.GotoAsync(targetUrl, new PageGotoOptions
+        try
         {
-            WaitUntil = WaitUntilState.DOMContentLoaded,
-            Timeout = _config.Timeouts.NavigationTimeoutMs
-        });
+            await newPage.GotoAsync(targetUrl, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = _config.Timeouts.NavigationTimeoutMs
+            });
+
+            // Handle potential about:blank or stuck pages right after navigation
+            if (newPage.Url == "about:blank")
+            {
+                Log("[yellow]Detected about:blank after navigation. Retrying...[/]");
+                await Task.Delay(2000, ct);
+                await newPage.GotoAsync(targetUrl, new PageGotoOptions
+                {
+                    WaitUntil = WaitUntilState.DOMContentLoaded,
+                    Timeout = _config.Timeouts.NavigationTimeoutMs
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"[red]Navigation error on tab creation:[/] {Markup.Escape(ex.Message)}");
+            // Continuing because Playwright sometimes throws on complex bot challenges, but the page may still resolve eventually manually
+        }
         
         Log($"Navigation complete for [cyan]{Markup.Escape(agentName)}[/].");
         _tabs[agentName] = newPage;
@@ -236,7 +296,16 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
                     Log($"[yellow][[SELF-HEALING]][/] Attempting recovery after exception...");
                     try
                     {
-                        await ResetTabStateAsync(agentName, platform, ct);
+                        if (ex.Message.Contains("closed", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("Target page", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log($"[red][[SELF-HEALING]][/] Browser context appears fatally closed. Executing full browser reinitialization...");
+                            await ReinitializeAsync(_config.WebFallback.Headless);
+                        }
+                        else
+                        {
+                            await ResetTabStateAsync(agentName, platform, ct);
+                        }
+                        
                         currentPrompt = "[SYSTEM RECOVERY: Previous UI state crashed. Resuming task.]\n\n" + prompt;
                         continue;
                     }
@@ -330,7 +399,27 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         await page.Keyboard.InsertTextAsync(prompt).WaitAsync(injectionTimeout, ct);
         
         await Task.Delay(500, ct);
-        await page.Keyboard.PressAsync("Enter").WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+        // Try hitting generic send buttons first, fallback to Enter/Ctrl+Enter
+        await page.EvaluateAsync(@"() => {
+            const btns = document.querySelectorAll('button');
+            const validLabels = ['send message', 'send', 'mesajı gönder', 'gönder'];
+            for(const b of btns) {
+                const label = (b.getAttribute('aria-label') || '').toLowerCase().trim();
+                const testid = (b.getAttribute('data-testid') || '').toLowerCase().trim();
+                const title = (b.getAttribute('title') || '').toLowerCase().trim();
+                
+                if (validLabels.includes(label) || validLabels.includes(title) || testid === 'send-button') {
+                    if (b.offsetWidth > 0 || b.offsetHeight > 0 && !b.disabled) {
+                        b.click();
+                        return;
+                    }
+                }
+            }
+        }").WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+        await Task.Delay(200, ct);
+        await page.Keyboard.PressAsync("Enter").WaitAsync(TimeSpan.FromSeconds(2), ct);
 
         // ── STEP 3: Poll for Response (Platform-Aware) ──────────────
         Log($"({Markup.Escape(agentName)}) Polling {platform.Name} for response...");
@@ -361,6 +450,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
                     return false;
                 }}").WaitAsync(TimeSpan.FromSeconds(5), ct);
             }
+            catch (OperationCanceledException) { throw; }
             catch { /* ignore transient */ }
 
             // Extract response text
@@ -379,6 +469,7 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
                     return '';
                 }}").WaitAsync(TimeSpan.FromSeconds(5), ct);
             }
+            catch (OperationCanceledException) { throw; }
             catch { /* ignore transient */ }
 
             if (!string.IsNullOrWhiteSpace(currentText))
@@ -405,7 +496,9 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
             if (watchdog.Elapsed.TotalSeconds > _config.Timeouts.StallDetectionSeconds)
             {
                 Log($"[yellow][[STABILITY]][/] Generation stall on {platform.Name}. Silent reload...");
-                try { await page.ReloadAsync().WaitAsync(TimeSpan.FromSeconds(10), ct); } catch { }
+                try { await page.ReloadAsync().WaitAsync(TimeSpan.FromSeconds(10), ct); } 
+                catch (OperationCanceledException) { throw; }
+                catch { }
                 watchdog.Restart();
                 await Task.Delay(2000, ct);
                 continue;
@@ -576,14 +669,37 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
         foreach (var platform in _config.Platforms.Where(p => p.Enabled))
         {
             var loginTabName = $"Login_{platform.Name}";
-            var page = await _context.NewPageAsync();
+            
+            // Reuse the default blank page for the first tab
+            var page = openedPlatforms.Count == 0 && _context.Pages.Count > 0 
+                ? _context.Pages[0] 
+                : await _context.NewPageAsync();
             
             Log($"Opening login tab for [cyan]{platform.Name}[/] → {platform.LoginUrl}");
-            await page.GotoAsync(platform.LoginUrl, new PageGotoOptions
+            
+            try
             {
-                WaitUntil = WaitUntilState.DOMContentLoaded,
-                Timeout = _config.Timeouts.NavigationTimeoutMs
-            });
+                await page.GotoAsync(platform.LoginUrl, new PageGotoOptions
+                {
+                    WaitUntil = WaitUntilState.DOMContentLoaded,
+                    Timeout = _config.Timeouts.NavigationTimeoutMs
+                });
+                
+                // If it resolves to about:blank again, retry once
+                if (page.Url == "about:blank")
+                {
+                    await Task.Delay(2000);
+                    await page.GotoAsync(platform.LoginUrl, new PageGotoOptions
+                    {
+                        WaitUntil = WaitUntilState.DOMContentLoaded,
+                        Timeout = _config.Timeouts.NavigationTimeoutMs
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[red]Failed to navigate to {platform.Name} login:[/] {Markup.Escape(ex.Message)}");
+            }
 
             _tabs[loginTabName] = page;
             openedPlatforms.Add(platform.Name);

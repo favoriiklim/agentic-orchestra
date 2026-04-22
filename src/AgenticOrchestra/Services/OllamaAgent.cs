@@ -1,21 +1,28 @@
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AgenticOrchestra.Models;
-using Spectre.Console;
 
 namespace AgenticOrchestra.Services;
 
 /// <summary>
-/// Service for interacting with a localized Ollama instance.
-/// Connects via REST API (port 11434 by default).
-/// Uses STREAMING to prevent timeout on large models and provide real-time feedback.
+/// Layer 1 Agent: Local Ollama/Gemma instance.
+/// In the 3-layer hierarchy, this acts as a COMMUNICATION INTERFACE ONLY:
+///   - Classifies user prompts (simple vs complex)
+///   - Presents ManagerTelemetry JSON as human-readable text
+///   - Never performs actual operational planning or coding tasks
 /// </summary>
 public sealed class OllamaAgent
 {
     private readonly AppConfig _config;
     private readonly HttpClient _httpClient;
+
+    private static readonly JsonSerializerOptions TelemetryJsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     public OllamaAgent(AppConfig config)
     {
@@ -23,8 +30,7 @@ public sealed class OllamaAgent
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(config.Ollama.Endpoint),
-            // High timeout only as a safety net - streaming keeps the connection alive
-            Timeout = TimeSpan.FromMinutes(10)
+            Timeout = TimeSpan.FromSeconds(config.Ollama.TimeoutSeconds)
         };
     }
 
@@ -66,10 +72,9 @@ public sealed class OllamaAgent
 
     /// <summary>
     /// Sends a prompt along with the conversation history to Ollama.
-    /// Uses STREAMING mode: reads tokens incrementally so the connection never times out.
-    /// The optional onToken callback is invoked for each received token fragment.
+    /// Returns the generated response string.
     /// </summary>
-    public async Task<string> SendPromptAsync(List<ChatMessage> history, Action<string>? onToken = null)
+    public async Task<string> SendPromptAsync(List<ChatMessage> history)
     {
         if (history == null || history.Count == 0)
         {
@@ -80,58 +85,141 @@ public sealed class OllamaAgent
         {
             model = _config.Ollama.Model,
             messages = history,
-            stream = true
+            stream = false // We request the entire response object at once for simplicity in MVP
         };
 
-        var jsonContent = new StringContent(
-            JsonSerializer.Serialize(requestBody),
-            Encoding.UTF8,
-            "application/json"
-        );
+        var response = await _httpClient.PostAsJsonAsync("/api/chat", requestBody);
+        response.EnsureSuccessStatusCode();
 
-        var response = await _httpClient.SendAsync(
-            new HttpRequestMessage(HttpMethod.Post, "/api/chat") { Content = jsonContent },
-            HttpCompletionOption.ResponseHeadersRead
-        );
+        var responseData = await response.Content.ReadFromJsonAsync<OllamaChatResponse>();
+        
+        return responseData?.Message?.Content ?? string.Empty;
+    }
 
-        if (!response.IsSuccessStatusCode)
+    // ── Layer 1 Specialized Methods (3-Layer Hierarchy) ────────────
+
+    /// <summary>
+    /// Classifies the user's prompt to determine whether it should be handled
+    /// locally (simple greetings/questions) or delegated to the Web Manager AI.
+    /// Returns a ManagerTaskRequest with the classification, or null if the task is simple.
+    /// </summary>
+    public async Task<ManagerTaskRequest?> ClassifyPromptAsync(string userPrompt, string projectContext)
+    {
+        var classificationPrompt = new List<ChatMessage>
         {
-            var errorText = await response.Content.ReadAsStringAsync();
-            throw new Exception($"Ollama API Error ({(int)response.StatusCode}): {errorText}");
-        }
+            new ChatMessage
+            {
+                Role = ChatRole.System,
+                Content = @"You are a task classifier for an AI orchestration system. Your ONLY job is to categorize user input.
 
-        // ── Stream the response token by token ──
-        var fullResponse = new StringBuilder();
+RULES:
+- Respond with EXACTLY one JSON object, nothing else.
+- Format: {""category"": ""<category>"", ""reasoning"": ""<one sentence>""}
+- Categories:
+  - ""simple"": Greetings, small talk, thank you messages, asking what you can do, basic questions answerable in one sentence.
+  - ""code"": Writing, debugging, refactoring, or reviewing code. Creating projects. Build/deployment tasks.
+  - ""research"": Looking up documentation, comparing technologies, investigating errors, searching for solutions.
+  - ""debug"": Diagnosing runtime errors, log analysis, troubleshooting system issues.
+  - ""general"": Anything complex that doesn't fit above: planning, multi-step analysis, architecture design.
 
-        using var stream = await response.Content.ReadAsStreamAsync();
-        using var reader = new StreamReader(stream);
+Respond ONLY with the JSON. No markdown fences, no extra text."
+            },
+            new ChatMessage
+            {
+                Role = ChatRole.User,
+                Content = userPrompt
+            }
+        };
 
-        while (!reader.EndOfStream)
+        try
         {
-            var line = await reader.ReadLineAsync();
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            var classificationResult = await SendPromptAsync(classificationPrompt);
+            
+            // Attempt to parse the classification JSON
+            using var doc = JsonDocument.Parse(classificationResult);
+            var category = doc.RootElement.GetProperty("category").GetString() ?? "general";
 
-            try
+            if (category.Equals("simple", StringComparison.OrdinalIgnoreCase))
             {
-                var chunk = JsonSerializer.Deserialize<OllamaStreamChunk>(line);
-                if (chunk?.Message?.Content != null)
-                {
-                    fullResponse.Append(chunk.Message.Content);
-                    onToken?.Invoke(chunk.Message.Content); // Live callback
-                }
+                return null; // Signal: handle locally, don't delegate
+            }
 
-                if (chunk?.Done == true)
-                {
-                    break;
-                }
-            }
-            catch (JsonException)
+            return new ManagerTaskRequest
             {
-                continue;
-            }
+                UserPrompt = userPrompt,
+                TaskCategory = category,
+                ProjectContext = projectContext
+            };
         }
+        catch
+        {
+            // If classification fails (JSON parse error, etc.), default to delegating
+            // Safer to send to the Manager than to handle a complex task locally
+            return new ManagerTaskRequest
+            {
+                UserPrompt = userPrompt,
+                TaskCategory = "general",
+                ProjectContext = projectContext
+            };
+        }
+    }
 
-        return fullResponse.ToString();
+    /// <summary>
+    /// Takes a raw ManagerTelemetry JSON object and asks the local model to present it
+    /// as clean, human-readable text for the user. This is the final step in the
+    /// Normal Mode pipeline: Manager produces JSON → Local Model translates to prose.
+    /// </summary>
+    public async Task<string> PresentTelemetryAsync(ManagerTelemetry telemetry)
+    {
+        var telemetryJson = JsonSerializer.Serialize(telemetry, TelemetryJsonOptions);
+
+        var presentationPrompt = new List<ChatMessage>
+        {
+            new ChatMessage
+            {
+                Role = ChatRole.System,
+                Content = @"You are a status reporter for an AI engineering system. You receive a JSON telemetry report from the Manager AI that executed a task. Your job is to translate this JSON into clear, readable text for the human user.
+
+RULES:
+1. Present the outcome naturally — do NOT just dump the JSON fields.
+2. If workers were spawned, briefly mention what each did.
+3. If errors occurred, explain them clearly.
+4. If files were written or commands executed, highlight the key results.
+5. End with the final outcome or next steps.
+6. Be concise but informative. Use bullet points for multiple items.
+7. Do NOT wrap your response in code blocks or JSON."
+            },
+            new ChatMessage
+            {
+                Role = ChatRole.User,
+                Content = $"Present this telemetry report to the user:\n\n{telemetryJson}"
+            }
+        };
+
+        try
+        {
+            return await SendPromptAsync(presentationPrompt);
+        }
+        catch
+        {
+            // If presentation fails, return raw telemetry as fallback
+            return $"[Telemetry Report]\nTask: {telemetry.TaskExecuted}\nOutcome: {telemetry.FinalOutcome}\nWorkers: {string.Join(", ", telemetry.WorkersSpawned)}\nErrors: {telemetry.ErrorsHandled}";
+        }
+    }
+
+    /// <summary>
+    /// Simple direct response for "simple" category prompts that don't need
+    /// the full orchestration pipeline. Used in Normal Mode only.
+    /// </summary>
+    public async Task<string> RespondDirectlyAsync(string userPrompt, List<ChatMessage> history)
+    {
+        // Add the current prompt to a copy of history for context
+        var messages = new List<ChatMessage>(history)
+        {
+            new ChatMessage { Role = ChatRole.User, Content = userPrompt }
+        };
+
+        return await SendPromptAsync(messages);
     }
 }
 
@@ -153,17 +241,4 @@ internal class OllamaChatResponse
 {
     [JsonPropertyName("message")]
     public ChatMessage? Message { get; set; }
-}
-
-/// <summary>
-/// Represents a single chunk in the Ollama streaming response.
-/// Each line of the NDJSON stream contains one of these.
-/// </summary>
-internal class OllamaStreamChunk
-{
-    [JsonPropertyName("message")]
-    public ChatMessage? Message { get; set; }
-
-    [JsonPropertyName("done")]
-    public bool Done { get; set; }
 }

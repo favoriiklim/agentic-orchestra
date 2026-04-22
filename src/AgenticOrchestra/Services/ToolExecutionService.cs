@@ -168,7 +168,7 @@ public sealed class ToolExecutionService : IDisposable
                 try
                 {
                     await _agentManager.InitializeAsync();
-                    var webResult = await _agentManager.ProcessUserInputAsync(
+                    var webResult = await _agentManager.ProcessDirectAsync(
                         $"[SPAWN: {agentName} | {taskInstruction}]"
                     );
                     loopFeedBuilder.AppendLine($"Result of SPAWN '{agentName}':\n{webResult}\n");

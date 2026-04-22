@@ -1,13 +1,21 @@
-using System.Text.RegularExpressions;
 using AgenticOrchestra.Models;
 using Spectre.Console;
 
 namespace AgenticOrchestra.Services;
 
 /// <summary>
-/// Coordinates the hybrid AI pipeline.
-/// Attempts to use the local Ollama instance first.
-/// If unavailable, it falls back to the Playwright web automation agent.
+/// Coordinates the 3-Layer Hierarchical Chain pipeline with Squad Pattern:
+///   Layer 1: Local Model (Ollama/Gemma) — Communication Interface
+///   Layer 2: Web Manager AI — Operational Brain
+///   Layer 3: Squad Agents (Innovator + Implementer + Critic) — Parallel Triad
+///
+/// NORMAL MODE:
+///   User → Ollama(classify) → WebManager(execute+squad) → Ollama(present) → User
+///
+/// HARD FALLBACK MODE (Ollama unavailable):
+///   User → WebManager(direct conversation + orchestration) → User
+///
+/// Supports global CancellationTokenSource for graceful task interruption.
 /// </summary>
 public sealed class OrchestratorService : IAsyncDisposable
 {
@@ -16,15 +24,24 @@ public sealed class OrchestratorService : IAsyncDisposable
     private readonly PlaywrightWebAgent _webAgent;
     private readonly SessionLoggingService _sessionLogger;
     private readonly AgentManagerService _agentManager;
-    private readonly ToolExecutionService _toolExecution;
+    private readonly DreamingService _dreamingService;
     
     private readonly List<ChatMessage> _history;
+    private bool _webManagerInitialized = false;
+
+    // ── Global Cancellation ──────────────────────────────────────────
+    private CancellationTokenSource _globalCts = new();
 
     /// <summary>
-    /// Indicates whether the current active provider is the local Ollama instance.
-    /// Can be used by the UI to display the active mode.
+    /// True when Layer 1 (Ollama) is unavailable and the system has bypassed it,
+    /// connecting the user directly to the Web Manager AI.
     /// </summary>
-    public bool IsUsingLocalAgent { get; private set; }
+    public bool IsHardFallback { get; private set; }
+
+    /// <summary>
+    /// True when Layer 1 handled the prompt locally (simple/greeting prompts).
+    /// </summary>
+    public bool IsLocalOnly { get; private set; }
 
     public OrchestratorService(AppConfig config)
     {
@@ -32,157 +49,235 @@ public sealed class OrchestratorService : IAsyncDisposable
         _ollamaAgent = new OllamaAgent(config);
         _webAgent = new PlaywrightWebAgent(config);
         _sessionLogger = new SessionLoggingService();
-        _toolExecution = new ToolExecutionService(config);
-        _agentManager = new AgentManagerService(_webAgent, _sessionLogger, _toolExecution);
-        _toolExecution.SetAgentManager(_agentManager); // Bridge local→web spawning
-        _history = new List<ChatMessage>();
+        _agentManager = new AgentManagerService(_webAgent, _sessionLogger, config);
+        _dreamingService = new DreamingService(_webAgent, _sessionLogger, config);
+        _history = new List<ChatMessage>
+        {
+            new ChatMessage { Role = ChatRole.System, Content = config.SystemPrompt }
+        };
     }
 
     /// <summary>
-    /// Loads a historic state into the live orchestrator memory.
+    /// Gets the current active pipeline label for UI display.
     /// </summary>
-    public void LoadState(SessionData session)
+    public string ActiveProviderName
     {
-        _history.Clear();
-        _history.AddRange(session.RawHistory);
+        get
+        {
+            if (IsHardFallback) return "⚠️ Hard Fallback · Web Manager AI (Direct)";
+            if (IsLocalOnly) return $"Ollama · {_config.Ollama.Model}";
+            return $"3-Layer Chain · {_config.Ollama.Model} → Web Manager AI";
+        }
     }
 
-    /// <summary>
-    /// Gets the current active provider label.
-    /// </summary>
-    public string ActiveProviderName => IsUsingLocalAgent 
-        ? $"Ollama · {_config.Ollama.Model}" 
-        : "Web Session";
+    // ═══════════════════════════════════════════════════════════════════
+    //  CANCELLATION CONTROL
+    // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Sends a prompt through the orchestration pipeline.
-    /// Manages the internal conversation history.
+    /// Cancels the currently running task. Called by --stop or Ctrl+C handler.
+    /// Resets the CTS for the next task.
+    /// </summary>
+    public void CancelCurrentTask()
+    {
+        if (!_globalCts.IsCancellationRequested)
+        {
+            _globalCts.Cancel();
+            AnsiConsole.MarkupLine("\n[bold red]⛔ STOP signal sent. Cancelling current task...[/]");
+        }
+    }
+
+    /// <summary>Resets the cancellation token for the next prompt cycle.</summary>
+    private void ResetCancellation()
+    {
+        if (_globalCts.IsCancellationRequested)
+        {
+            _globalCts.Dispose();
+            _globalCts = new CancellationTokenSource();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  MAIN PIPELINE
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Sends a prompt through the 3-layer hierarchical chain pipeline.
+    /// Checks Layer 1 availability at the start of each cycle for Graceful Degradation.
+    /// Supports cancellation via the global CancellationTokenSource.
     /// </summary>
     public async Task<string> ProcessPromptAsync(string prompt)
     {
-        // 1. Dreaming logic injection
-        if (prompt.Trim() == "[SYSTEM_DREAMING_TRIGGER]")
-        {
-            AnsiConsole.MarkupLine("\n[dim purple]💤 Agent is Dreaming (Background Analysis)...[/]");
-            prompt = "You are now in dreaming mode. Analyze the current project state, compress your long-term memory summary, and suggest 3 innovative improvements or code optimizations for the current environment. Keep it robust and forward-thinking.";
-        }
+        ResetCancellation();
+        var ct = _globalCts.Token;
 
-        // 2. Add user prompt to history
         _history.Add(new ChatMessage { Role = ChatRole.User, Content = prompt });
+        string responseText;
 
-        await _sessionLogger.UpdateRawHistoryAsync(_history);
-
-        string responseText = string.Empty;
-
-        // 3. Fallback Logic Pipeline
-        IsUsingLocalAgent = await _ollamaAgent.IsAvailableAsync();
-        bool fallbackToWeb = !IsUsingLocalAgent;
-
-        if (IsUsingLocalAgent)
+        try
         {
-            _toolExecution.ResetBudget();
-            try
+            // ── Availability Check: Is Layer 1 (Ollama) online? ──────
+            bool ollamaAvailable = await _ollamaAgent.IsAvailableAsync();
+
+            if (ollamaAvailable)
             {
-                while (true)
-                {
-                    // Path A: Local execution via Ollama
-                    // ═══════════════════════════════════════════════════════════
-                    // KV-CACHE-FRIENDLY PAYLOAD CONSTRUCTION
-                    // ═══════════════════════════════════════════════════════════
+                // ═══════════════════════════════════════════════════════
+                //  NORMAL MODE: Full 3-Layer Chain
+                // ═══════════════════════════════════════════════════════
+                IsHardFallback = false;
 
-                    // ── Layer 1: STATIC System Role (cacheable) ──
-                    var payload = new List<ChatMessage>
+                // Step 1: Layer 1 classifies the prompt
+                ManagerTaskRequest? taskRequest = null;
+                await AnsiConsole.Status()
+                    .SpinnerStyle(Style.Parse("magenta"))
+                    .StartAsync($"(Layer 1 · {_config.Ollama.Model}) Classifying prompt...", async ctx =>
                     {
-                        new ChatMessage { Role = ChatRole.System, Content = _config.SystemPrompt }
-                    };
-
-                    // ── Layer 2: Minimal Few-Shot (2 messages only, cacheable) ──
-                    payload.Add(new ChatMessage { Role = ChatRole.User, Content = "Dizindeki dosyaları listele." });
-                    payload.Add(new ChatMessage { Role = ChatRole.Assistant, Content = "[TERMINAL_EXEC: Get-ChildItem]" });
-
-                    // ── Layer 3: Conversation history (dynamic tail) ──
-                    foreach (var msg in _history)
-                    {
-                        payload.Add(new ChatMessage { Role = msg.Role, Content = msg.Content });
-                    }
-
-                    // ── Layer 4: Lightweight recency reminder (no memory blob) ──
-                    var lastUserMsg = payload.Last(m => m.Role == ChatRole.User);
-                    lastUserMsg.Content = $"[RULES: Use bracket tokens only: [TERMINAL_EXEC:], [FILE_READ:], [FILE_WRITE:], [SPAWN_LOCAL_WORKER:], [WEB_SEARCH:]. NO markdown.]\n{lastUserMsg.Content}";
-
-                    // ── Live Streaming Display ──
-                    AnsiConsole.MarkupLine($"\n[dim]🧠 {Markup.Escape(ActiveProviderName)} generating...[/]");
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    
-                    responseText = await _ollamaAgent.SendPromptAsync(payload, token =>
-                    {
-                        Console.Write(token); // Print each token live
+                        string projectContext = _sessionLogger.GetMemoryInjectionString();
+                        taskRequest = await _ollamaAgent.ClassifyPromptAsync(prompt, projectContext);
                     });
 
-                    Console.ResetColor();
-                    Console.WriteLine(); // Newline after streaming finishes
+                if (taskRequest == null)
+                {
+                    // ── SIMPLE PROMPT: Handle locally ───────────────────
+                    IsLocalOnly = true;
+                    responseText = await _ollamaAgent.RespondDirectlyAsync(prompt, _history);
+                }
+                else
+                {
+                    // ── COMPLEX PROMPT: Delegate to Layer 2 + Squad ─────
+                    IsLocalOnly = false;
+                    AnsiConsole.MarkupLine($"[dim]Task classified as [cyan]{taskRequest.TaskCategory}[/]. Delegating to Web Manager AI (Layer 2)...[/]");
 
-                    // ── Extract and display Thinking Process (For DeepSeek-R1 / Reasoning Models) ──
-                    var thinkPattern = new Regex(@"<think>(.*?)</think>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
-                    var thinkMatches = thinkPattern.Matches(responseText);
-                    if (thinkMatches.Count > 0)
-                    {
-                        foreach (Match m in thinkMatches)
-                        {
-                            AnsiConsole.MarkupLine($"\n[dim grey]💭 Model Thinking:\n{Markup.Escape(m.Groups[1].Value.Trim())}[/]");
-                        }
-                        // Strip the thinking tokens so they don't interfere with tool parsing
-                        responseText = thinkPattern.Replace(responseText, "").Trim();
-                    }
+                    await EnsureWebManagerAsync();
+                    var telemetry = await _agentManager.ProcessTaskAsync(taskRequest, ct);
 
-                    var toolResult = await _toolExecution.ExecuteToolsAsync(responseText);
-                    if (toolResult.ActionsExecuted)
-                    {
-                        _history.Add(new ChatMessage { Role = ChatRole.Assistant, Content = responseText });
-                        _history.Add(new ChatMessage { Role = ChatRole.User, Content = "System Outcomes:\n" + toolResult.Output + "\nEvaluate results. If an error persists, fix it via [FILE_WRITE]. If done, give final response." });
-                        
-                        if (toolResult.BudgetExceeded) break;
-                        continue; 
-                    }
-                    break;
+                    // Step 3: Layer 1 presents the telemetry
+                    responseText = await _ollamaAgent.PresentTelemetryAsync(telemetry);
+
+                    await _dreamingService.CheckAndDreamIfNeededAsync();
                 }
             }
-            catch (Exception ex)
+            else
             {
-                AnsiConsole.MarkupLine($"\n[bold red]✕ Local Agent Error:[/] {Markup.Escape(ex.Message)}");
-                AnsiConsole.MarkupLine("[dim yellow]Automatically falling back to Web Agent for this request...[/]");
-                fallbackToWeb = true;
+                // ═══════════════════════════════════════════════════════
+                //  HARD FALLBACK MODE: Skip Layer 1, direct to Layer 2
+                //  The system MUST NOT crash or lock up when Ollama is down.
+                // ═══════════════════════════════════════════════════════
+                IsHardFallback = true;
+                IsLocalOnly = false;
+
+                if (!_webManagerInitialized)
+                {
+                    AnsiConsole.MarkupLine("[bold yellow]⚠️  HARD FALLBACK MODE: Local AI (Ollama) is unreachable.[/]");
+                    AnsiConsole.MarkupLine("[dim]Bypassing Layer 1. Connecting you directly to the Web Manager AI (Layer 2).[/]");
+                    AnsiConsole.MarkupLine("[dim]The system will check Ollama availability on each prompt. Normal mode resumes when Ollama is back online.[/]");
+                    AnsiConsole.WriteLine();
+                }
+
+                await EnsureWebManagerAsync();
+
+                // Direct pipeline: raw user text → Manager → raw response
+                // Manager can still spawn Squad if needed
+                responseText = await _agentManager.ProcessDirectAsync(prompt, ct);
+
+                await _dreamingService.CheckAndDreamIfNeededAsync();
             }
         }
-
-        if (fallbackToWeb)
+        catch (OperationCanceledException)
         {
-            // Path B: Fallback to Multi-Agent Browser orchestration
-            await _agentManager.InitializeAsync();
-            responseText = await _agentManager.ProcessUserInputAsync(prompt);
+            responseText = "(Task was cancelled by user. Ready for next command.)";
+            AnsiConsole.MarkupLine("[yellow]Task cancelled. Worker tabs cleaned up.[/]");
+            await _webAgent.CloseAllWorkersAsync();
         }
 
-        // 3. Append response to history
         _history.Add(new ChatMessage { Role = ChatRole.Assistant, Content = responseText });
-
         return responseText;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  LOGIN FLOW (--login command)
+    // ═══════════════════════════════════════════════════════════════════
+
     /// <summary>
-    /// Clears the current conversation history (except the initial system prompt).
+    /// Runs the interactive login flow:
+    /// 1. Reinitializes browser in visible (non-headless) mode
+    /// 2. Opens tabs for each enabled AI platform
+    /// 3. Waits for user to log in and press Enter
+    /// 4. Closes login tabs and reinitializes in headless mode
     /// </summary>
+    public async Task RunLoginFlowAsync()
+    {
+        AnsiConsole.MarkupLine("\n[bold cyan]🔑 LOGIN FLOW — Opening browser for platform authentication...[/]");
+
+        // Reinitialize browser in visible mode
+        bool wasHeadless = _config.WebFallback.Headless;
+        await _webAgent.ReinitializeAsync(headless: false);
+        _webManagerInitialized = false; // Force re-init after browser rebuild
+
+        // Open login tabs for each enabled platform
+        var platforms = await _webAgent.OpenLoginTabsAsync();
+        
+        if (platforms.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[yellow]No platforms enabled. Enable platforms in config.json first.[/]");
+            return;
+        }
+
+        AnsiConsole.MarkupLine($"[dim]Opened login tabs for: {string.Join(", ", platforms)}[/]");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold green]Please log into the web AI platforms in the opened browser window.[/]");
+        AnsiConsole.MarkupLine("[bold green]Press ENTER when finished.[/]");
+        Console.ReadLine();
+
+        // Close login tabs and persist state
+        await _webAgent.CloseLoginTabsAsync();
+
+        // Reinitialize in headless mode (or original mode)
+        await _webAgent.ReinitializeAsync(headless: wasHeadless);
+        _webManagerInitialized = false;
+
+        AnsiConsole.MarkupLine("[green]✓ Login complete. Browser state saved. Returning to session.[/]\n");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  DREAMING & UTILITIES
+    // ═══════════════════════════════════════════════════════════════════
+
+    private async Task EnsureWebManagerAsync()
+    {
+        if (!_webManagerInitialized)
+        {
+            await _agentManager.InitializeAsync();
+            _webManagerInitialized = true;
+        }
+    }
+
+    public async Task<DreamRecord> TriggerDreamAsync()
+    {
+        await EnsureWebManagerAsync();
+        return await _dreamingService.RunDreamCycleAsync();
+    }
+
+    public async Task RunExitDreamIfEnabledAsync()
+    {
+        if (_config.Dreaming.AutoDreamOnExit && _sessionLogger.GetTelemetryCount() > 0)
+        {
+            AnsiConsole.MarkupLine("\n[mediumpurple3]💤 Running exit dream analysis...[/]");
+            await EnsureWebManagerAsync();
+            await _dreamingService.RunDreamCycleAsync();
+        }
+    }
+
     public void ClearHistory()
     {
         _history.Clear();
+        _history.Add(new ChatMessage { Role = ChatRole.System, Content = _config.SystemPrompt });
     }
 
-    /// <summary>
-    /// Safely tears down the Orchestrator pipeline, saving sessions and closing automated browser instances.
-    /// </summary>
     public async ValueTask DisposeAsync()
     {
+        _globalCts.Dispose();
         await _webAgent.DisposeAsync();
         await _agentManager.DisposeAsync();
-        _toolExecution.Dispose();
     }
 }
