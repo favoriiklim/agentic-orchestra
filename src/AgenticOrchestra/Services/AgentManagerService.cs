@@ -44,6 +44,7 @@ public sealed class AgentManagerService : IAsyncDisposable
         _squadService = new SquadService(webAgent, sessionLogger, config);
         _toolService = new ToolExecutionService(config);
         _toolService.SetAgentManager(this);
+        _toolService.SetWebAgent(webAgent);
     }
 
     public async Task InitializeAsync()
@@ -66,7 +67,7 @@ public sealed class AgentManagerService : IAsyncDisposable
     {
         AnsiConsole.MarkupLine("[dim]Injecting 3-Layer Hierarchy Identity & Memory into Web Manager AI...[/]");
         
-        string memoryContext = _sessionLogger.GetMemoryInjectionString();
+        string memoryContext = await _sessionLogger.GetMemoryInjectionStringAsync();
 
         var systemPrompt = $@"You are the Web Manager AI — a General-Purpose Autonomous Senior Software Architect & System Operator.
 You are the central operational brain of a 3-Layer Autonomous Engineering System (AgenticOrchestra).

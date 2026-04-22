@@ -74,11 +74,14 @@ public sealed class WebFallbackSettings
 /// </summary>
 public sealed class DreamingSettings
 {
-    /// <summary>Number of telemetries to accumulate before auto-triggering a dream cycle.</summary>
+    /// <summary>Number of new telemetries (since last dream) to accumulate before auto-triggering a dream cycle.</summary>
     public int TelemetryThreshold { get; set; } = 10;
 
+    /// <summary>Whether to enable automatic dream analysis after each prompt cycle. Default: false (manual --dream only).</summary>
+    public bool AutoDreamEnabled { get; set; } = false;
+
     /// <summary>Whether to automatically run a dream analysis when the user exits the session.</summary>
-    public bool AutoDreamOnExit { get; set; } = true;
+    public bool AutoDreamOnExit { get; set; } = false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

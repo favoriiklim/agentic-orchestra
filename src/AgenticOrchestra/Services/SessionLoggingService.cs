@@ -112,14 +112,15 @@ public sealed class SessionLoggingService
 
     /// <summary>
     /// Returns the most recent N telemetry records for DreamingService analysis.
+    /// Uses snapshot-under-lock: acquires async, copies, releases immediately.
     /// </summary>
-    public List<ManagerTelemetry> GetRecentTelemetries(int count)
+    public async Task<List<ManagerTelemetry>> GetRecentTelemetriesAsync(int count)
     {
-        // For reads, we lock briefly to ensure the list is not modified during counting/enumerable
-        _semaphore.Wait();
+        await _semaphore.WaitAsync();
+        List<ManagerTelemetry> snapshot;
         try
         {
-            return _currentSession.TelemetryLog
+            snapshot = _currentSession.TelemetryLog
                 .TakeLast(count)
                 .ToList();
         }
@@ -127,17 +128,55 @@ public sealed class SessionLoggingService
         {
             _semaphore.Release();
         }
+        return snapshot;
     }
 
     /// <summary>
-    /// Returns the total count of unanalyzed telemetries since the last dream.
+    /// Returns the total count of telemetries in the session.
     /// </summary>
-    public int GetTelemetryCount() 
+    public async Task<int> GetTelemetryCountAsync()
     {
-        _semaphore.Wait();
+        await _semaphore.WaitAsync();
+        int count;
         try
         {
-            return _currentSession.TelemetryLog.Count;
+            count = _currentSession.TelemetryLog.Count;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Returns the persisted count of telemetries at the time of the last completed dream.
+    /// </summary>
+    public async Task<int> GetLastDreamTelemetryCountAsync()
+    {
+        await _semaphore.WaitAsync();
+        int value;
+        try
+        {
+            value = _currentSession.LastDreamTelemetryCount;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+        return value;
+    }
+
+    /// <summary>
+    /// Persists the telemetry count marker after a completed dream cycle.
+    /// </summary>
+    public async Task SetLastDreamTelemetryCountAsync(int count)
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            _currentSession.LastDreamTelemetryCount = count;
+            await SaveSessionAsync();
         }
         finally
         {
@@ -172,20 +211,22 @@ public sealed class SessionLoggingService
 
     /// <summary>
     /// Returns the consolidated insight from the most recent dream, if any.
-    /// Used for memory injection into the Manager's system prompt.
+    /// Uses snapshot-under-lock: acquires async, reads value, releases immediately.
     /// </summary>
-    public string? GetLatestDreamInsight()
+    public async Task<string?> GetLatestDreamInsightAsync()
     {
-        _semaphore.Wait();
+        await _semaphore.WaitAsync();
+        string? insight;
         try
         {
             var latestDream = _currentSession.DreamLog.LastOrDefault();
-            return latestDream?.ConsolidatedInsight;
+            insight = latestDream?.ConsolidatedInsight;
         }
         finally
         {
             _semaphore.Release();
         }
+        return insight;
     }
 
     /// <summary>
@@ -216,50 +257,57 @@ public sealed class SessionLoggingService
     /// Wraps the global summary alongside the raw data of the last 5 operations,
     /// plus any dream insights from previous sessions.
     /// </summary>
-    public string GetMemoryInjectionString()
+    public async Task<string> GetMemoryInjectionStringAsync()
     {
-        _semaphore.Wait();
+        // Snapshot session state under lock
+        string projectSummary;
+        List<AgentOperation> recentOps;
+        string? dreamInsight;
+
+        await _semaphore.WaitAsync();
         try
         {
-            var stringBuilder = new System.Text.StringBuilder();
-            stringBuilder.AppendLine("### [SYSTEM MEMORY: EXISTING PROJECT STATE] ###");
-            stringBuilder.AppendLine(_currentSession.ProjectStateSummary);
-            stringBuilder.AppendLine();
-            
-            var recentOps = _currentSession.Operations.TakeLast(5).ToList();
-            if (recentOps.Count > 0)
-            {
-                stringBuilder.AppendLine("### [SYSTEM MEMORY: LAST 5 OPERATIONS] ###");
-                foreach (var op in recentOps)
-                {
-                    stringBuilder.AppendLine($"[AGENT: {op.AgentName}]");
-                    stringBuilder.AppendLine($"TASK: {op.TaskInstruction}");
-                    stringBuilder.AppendLine($"RESULT: {op.OutputResult}");
-                    stringBuilder.AppendLine("---");
-                }
-            }
-            else
-            {
-                stringBuilder.AppendLine("No preceding operations exist in the current memory bank.");
-            }
-
-            // ── Dream Insights Injection ──
+            projectSummary = _currentSession.ProjectStateSummary;
+            recentOps = _currentSession.Operations.TakeLast(5).ToList();
             var latestDream = _currentSession.DreamLog.LastOrDefault();
-            var dreamInsight = latestDream?.ConsolidatedInsight;
-            if (!string.IsNullOrWhiteSpace(dreamInsight))
-            {
-                stringBuilder.AppendLine();
-                stringBuilder.AppendLine("### [SYSTEM MEMORY: DREAM ANALYSIS INSIGHTS] ###");
-                stringBuilder.AppendLine("The following insights were learned from analyzing your past task execution patterns:");
-                stringBuilder.AppendLine(dreamInsight);
-            }
-
-            return stringBuilder.ToString();
+            dreamInsight = latestDream?.ConsolidatedInsight;
         }
         finally
         {
             _semaphore.Release();
         }
+
+        // Build the string outside the lock
+        var stringBuilder = new System.Text.StringBuilder();
+        stringBuilder.AppendLine("### [SYSTEM MEMORY: EXISTING PROJECT STATE] ###");
+        stringBuilder.AppendLine(projectSummary);
+        stringBuilder.AppendLine();
+        
+        if (recentOps.Count > 0)
+        {
+            stringBuilder.AppendLine("### [SYSTEM MEMORY: LAST 5 OPERATIONS] ###");
+            foreach (var op in recentOps)
+            {
+                stringBuilder.AppendLine($"[AGENT: {op.AgentName}]");
+                stringBuilder.AppendLine($"TASK: {op.TaskInstruction}");
+                stringBuilder.AppendLine($"RESULT: {op.OutputResult}");
+                stringBuilder.AppendLine("---");
+            }
+        }
+        else
+        {
+            stringBuilder.AppendLine("No preceding operations exist in the current memory bank.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(dreamInsight))
+        {
+            stringBuilder.AppendLine();
+            stringBuilder.AppendLine("### [SYSTEM MEMORY: DREAM ANALYSIS INSIGHTS] ###");
+            stringBuilder.AppendLine("The following insights were learned from analyzing your past task execution patterns:");
+            stringBuilder.AppendLine(dreamInsight);
+        }
+
+        return stringBuilder.ToString();
     }
 
     /// <summary>

@@ -132,7 +132,7 @@ public sealed class OrchestratorService : IAsyncDisposable
                     .SpinnerStyle(Style.Parse("magenta"))
                     .StartAsync($"(Layer 1 · {_config.Ollama.Model}) Classifying prompt...", async ctx =>
                     {
-                        string projectContext = _sessionLogger.GetMemoryInjectionString();
+                        string projectContext = await _sessionLogger.GetMemoryInjectionStringAsync();
                         taskRequest = await _ollamaAgent.ClassifyPromptAsync(prompt, projectContext);
                     });
 
@@ -154,7 +154,8 @@ public sealed class OrchestratorService : IAsyncDisposable
                     // Step 3: Layer 1 presents the telemetry
                     responseText = await _ollamaAgent.PresentTelemetryAsync(telemetry);
 
-                    await _dreamingService.CheckAndDreamIfNeededAsync();
+                    if (_config.Dreaming.AutoDreamEnabled)
+                        await _dreamingService.CheckAndDreamIfNeededAsync(ct);
                 }
             }
             else
@@ -180,7 +181,8 @@ public sealed class OrchestratorService : IAsyncDisposable
                 // Manager can still spawn Squad if needed
                 responseText = await _agentManager.ProcessDirectAsync(prompt, ct);
 
-                await _dreamingService.CheckAndDreamIfNeededAsync();
+                if (_config.Dreaming.AutoDreamEnabled)
+                    await _dreamingService.CheckAndDreamIfNeededAsync(ct);
             }
         }
         catch (OperationCanceledException)
@@ -252,15 +254,15 @@ public sealed class OrchestratorService : IAsyncDisposable
         }
     }
 
-    public async Task<DreamRecord> TriggerDreamAsync()
+    public async Task<DreamRecord> TriggerDreamAsync(CancellationToken ct = default)
     {
         await EnsureWebManagerAsync();
-        return await _dreamingService.RunDreamCycleAsync();
+        return await _dreamingService.RunDreamCycleAsync(ct);
     }
 
     public async Task RunExitDreamIfEnabledAsync()
     {
-        if (_config.Dreaming.AutoDreamOnExit && _sessionLogger.GetTelemetryCount() > 0)
+        if (_config.Dreaming.AutoDreamOnExit && await _sessionLogger.GetTelemetryCountAsync() > 0)
         {
             AnsiConsole.MarkupLine("\n[mediumpurple3]💤 Running exit dream analysis...[/]");
             await EnsureWebManagerAsync();

@@ -19,7 +19,8 @@ public sealed class ToolExecutionService : IDisposable
     private readonly NativeFileService _fileService;
     private readonly NativeTerminalService _terminalService;
     private readonly HttpClient _httpClient;
-    private AgentManagerService? _agentManager; // Injected later to avoid circular dependency
+    private AgentManagerService? _agentManager;
+    private PlaywrightWebAgent? _webAgent;
     private int _consecutiveFailures = 0;
     private const int MaxRetryBudget = 5;
 
@@ -38,6 +39,14 @@ public sealed class ToolExecutionService : IDisposable
     public void SetAgentManager(AgentManagerService agentManager)
     {
         _agentManager = agentManager;
+    }
+
+    /// <summary>
+    /// Injects the web agent for direct SPAWN dispatch (avoids re-entry through AgentManager).
+    /// </summary>
+    public void SetWebAgent(PlaywrightWebAgent webAgent)
+    {
+        _webAgent = webAgent;
     }
 
     /// <summary>
@@ -75,7 +84,7 @@ public sealed class ToolExecutionService : IDisposable
             var cmd = m.Groups[1].Value.Trim();
             var dedupKey = $"EXEC:{cmd}";
             if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
-            var result = await _terminalService.ExecuteCommandAsync(cmd);
+            var result = await _terminalService.ExecuteCommandAsync(cmd, ct);
             
             // Heuristic error detection
             bool isError = result.Contains("__EXITCODE__:1") || result.Contains("Error: Command timed out or was interrupted");
@@ -100,6 +109,8 @@ public sealed class ToolExecutionService : IDisposable
                 return new ToolExecutionResult(loopFeedBuilder.ToString(), true, true);
             }
         }
+
+        ct.ThrowIfCancellationRequested();
 
         // 3. Parse File Writes
         var writeMatches = Regex.Matches(aiResponse, @"\[FILE_WRITE:\s*(?<path>[^|]+?)\|\s*(?<content>[\s\S]*?)\s*\](?=\s*\r?\n|\s*$)", RegexOptions.Singleline);
@@ -128,29 +139,33 @@ public sealed class ToolExecutionService : IDisposable
         var searchMatches = Regex.Matches(aiResponse, @"\[WEB_SEARCH:\s*([^\]]+)\]");
         foreach (Match m in searchMatches)
         {
+            ct.ThrowIfCancellationRequested();
             var query = m.Groups[1].Value.Trim();
-            AnsiConsole.Status().Start($"Searching web for: [bold]{Markup.Escape(query)}[/]...", async ctx => 
-            {
-                var searchResult = await PerformWebSearchAsync(query);
-                loopFeedBuilder.AppendLine($"Result of WEB_SEARCH '{query}':\n```\n{searchResult}\n```\n");
-            }).Wait();
+            AnsiConsole.MarkupLine($"[dim cyan]Searching web for:[/] {Markup.Escape(query)}");
+            var searchResult = await PerformWebSearchAsync(query, ct);
+            loopFeedBuilder.AppendLine($"Result of WEB_SEARCH '{query}':\n```\n{searchResult}\n```\n");
             actionExecuted = true;
         }
+
+        ct.ThrowIfCancellationRequested();
 
         // 5. Parse Local Worker Spawning
         var spawnMatches = Regex.Matches(aiResponse, @"\[SPAWN_LOCAL_WORKER:\s*(?<persona>.*?)\s*\|\s*(?<task>.*?)\]", RegexOptions.Singleline);
         foreach (Match m in spawnMatches)
         {
+            ct.ThrowIfCancellationRequested();
             var persona = m.Groups["persona"].Value.Trim();
             var taskContext = m.Groups["task"].Value.Trim();
 
             AnsiConsole.MarkupLine($"[bold magenta]🏗️ Spawning Local Worker:[/] [dim]{Markup.Escape(persona)}[/]");
             
-            var workerResult = await SpawnLocalWorkerAsync(persona, taskContext);
+            var workerResult = await SpawnLocalWorkerAsync(persona, taskContext, ct);
             loopFeedBuilder.AppendLine($"Result of LOCAL_WORKER (Persona: {persona}):\n{workerResult}\n");
             
             actionExecuted = true;
         }
+
+        ct.ThrowIfCancellationRequested();
 
         // 5.5 Process [SPAWN_SQUAD] — Squad Triad Deployment
         var squadMatches = Regex.Matches(aiResponse, @"\[SPAWN_SQUAD:\s*(.+?)\]", RegexOptions.Singleline);
@@ -168,35 +183,39 @@ public sealed class ToolExecutionService : IDisposable
             }
         }
 
-        // 6. Parse Web Agent Spawning [SPAWN: AgentName | Task] (Playwright bridge)
+        // 6. Parse Web Agent Spawning [SPAWN: AgentName | Task]
+        // Direct dispatch to a worker tab — no re-entry through AgentManager
         var webSpawnMatches = Regex.Matches(aiResponse, @"\[SPAWN:\s*(?<name>[^\|]+)\|\s*(?<task>.+?)\]", RegexOptions.Singleline);
         foreach (Match m in webSpawnMatches)
         {
+            ct.ThrowIfCancellationRequested();
             var agentName = m.Groups["name"].Value.Trim();
             var taskInstruction = m.Groups["task"].Value.Trim();
 
-            if (_agentManager != null)
+            if (_webAgent != null)
             {
                 AnsiConsole.MarkupLine($"[bold cyan]⚡ Spawning Web Agent:[/] [dim]{Markup.Escape(agentName)}[/]");
                 
                 try
                 {
-                    await _agentManager.InitializeAsync();
-                    var webResult = await _agentManager.ProcessDirectAsync(
-                        $"[SPAWN: {agentName} | {taskInstruction}]"
-                    );
+                    var webResult = await _webAgent.SendMessageAsync(agentName, taskInstruction, ct);
                     loopFeedBuilder.AppendLine($"Result of SPAWN '{agentName}':\n{webResult}\n");
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
                     loopFeedBuilder.AppendLine($"Result of SPAWN '{agentName}': FAILED - {ex.Message}\n");
                     AnsiConsole.MarkupLine($"[bold red]✕ Web Agent Spawn Failed:[/] {Markup.Escape(ex.Message)}");
                 }
+                finally
+                {
+                    try { await _webAgent.CloseWorkerTabAsync(agentName); } catch { /* best-effort */ }
+                }
             }
             else
             {
                 AnsiConsole.MarkupLine($"[bold yellow]⚠ SPAWN requested but Web Agent unavailable. Falling back to LOCAL_WORKER...[/]");
-                var fallbackResult = await SpawnLocalWorkerAsync(agentName, taskInstruction);
+                var fallbackResult = await SpawnLocalWorkerAsync(agentName, taskInstruction, ct);
                 loopFeedBuilder.AppendLine($"Result of SPAWN->LOCAL_WORKER '{agentName}':\n{fallbackResult}\n");
             }
             actionExecuted = true;
@@ -205,12 +224,13 @@ public sealed class ToolExecutionService : IDisposable
         return new ToolExecutionResult(loopFeedBuilder.ToString(), actionExecuted, false);
     }
 
-    private async Task<string> PerformWebSearchAsync(string query)
+    private async Task<string> PerformWebSearchAsync(string query, CancellationToken ct = default)
     {
         try 
         {
             var url = $"https://lite.duckduckgo.com/lite/?q={Uri.EscapeDataString(query)}";
-            var html = await _httpClient.GetStringAsync(url);
+            var response = await _httpClient.GetAsync(url, ct);
+            var html = await response.Content.ReadAsStringAsync(ct);
             
             // Extract result snippets using simple regex (titles and snippets)
             var matches = Regex.Matches(html, @"<a class=""result-link""[^>]*>(.*?)</a>.*?<td class=""result-snippet"">(.*?)</td>", RegexOptions.Singleline);
@@ -234,10 +254,11 @@ public sealed class ToolExecutionService : IDisposable
         }
     }
 
-    private async Task<string> SpawnLocalWorkerAsync(string persona, string task)
+    private async Task<string> SpawnLocalWorkerAsync(string persona, string task, CancellationToken ct = default)
     {
         try
         {
+            ct.ThrowIfCancellationRequested();
             var workerAgent = new OllamaAgent(_config);
             var payload = new List<ChatMessage>
             {

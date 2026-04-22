@@ -7,12 +7,15 @@ namespace AgenticOrchestra.UI;
 /// <summary>
 /// Renders the CLI interactive chat interface for the 3-Layer Hierarchical Chain with Squad Pattern.
 /// Shows layer indicators, fallback warnings, and supports execution control commands.
-/// Handles Ctrl+C gracefully via global CancellationTokenSource.
+/// Uses CancelKeyPolicy for deterministic Ctrl+C handling:
+///   First press: cancel current task.
+///   Second press within 2s: graceful shutdown (main loop exits, orchestrator disposes).
 /// </summary>
 public static class ChatView
 {
     private static bool _eventRegistered = false;
     private static OrchestratorService? _currentOrchestrator;
+    private static readonly CancelKeyPolicy _cancelPolicy = new();
 
     public static async Task RunAsync(OrchestratorService orchestrator, AppConfig config)
     {
@@ -29,14 +32,33 @@ public static class ChatView
         {
             Console.CancelKeyPress += (sender, e) =>
             {
-                e.Cancel = true; // Prevent process termination
-                _currentOrchestrator?.CancelCurrentTask();
+                e.Cancel = true; // Always prevent immediate process termination
+
+                var action = _cancelPolicy.HandlePress();
+                if (action == CancelAction.CancelTask)
+                {
+                    _currentOrchestrator?.CancelCurrentTask();
+                    AnsiConsole.MarkupLine("\n[bold yellow]⛔ Task cancelled. Press Ctrl+C again within 2s to exit the application.[/]");
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine("\n[bold red]🔴 Force exit requested. Shutting down gracefully...[/]");
+                }
             };
             _eventRegistered = true;
         }
 
         while (true)
         {
+            // Check if the user requested force-exit via double Ctrl+C
+            if (_cancelPolicy.ForceExitRequested)
+            {
+                AnsiConsole.MarkupLine("[dim]Gracefully tearing down all layers...[/]");
+                await orchestrator.RunExitDreamIfEnabledAsync();
+                await orchestrator.DisposeAsync();
+                return;
+            }
+
             // Show fallback warning if active
             if (orchestrator.IsHardFallback)
             {
@@ -51,6 +73,9 @@ public static class ChatView
             if (string.IsNullOrWhiteSpace(prompt))
                 continue;
 
+            // Reset cancel policy after user provides a new prompt
+            _cancelPolicy.Reset();
+
             // ── Command Parser ──
             if (prompt.StartsWith("--"))
             {
@@ -61,7 +86,7 @@ public static class ChatView
                     AnsiConsole.MarkupLine("[dim]Gracefully tearing down all layers...[/]");
                     await orchestrator.RunExitDreamIfEnabledAsync();
                     await orchestrator.DisposeAsync();
-                    Environment.Exit(0);
+                    return;
                 }
 
                 if (cmd == "--back" || cmd == "--menu")
@@ -149,7 +174,7 @@ public static class ChatView
         table.AddRow("[bold]--dream[/]", "Manually trigger Dream Analysis (sleep-mode learning).");
         table.AddRow("[bold]--login[/]", "Open browser visually to log into AI platforms (Gemini/ChatGPT/Claude).");
         table.AddRow("[bold]--stop[/]", "Cancel the currently running task gracefully.");
-        table.AddRow("[bold]Ctrl+C[/]", "Same as --stop — interrupts the active task without crashing.");
+        table.AddRow("[bold]Ctrl+C[/]", "First press: cancel task. Second press within 2s: exit application.");
         table.AddRow("[bold]--back[/] / [bold]--menu[/]", "Return to the main menu. Web Manager AI remains alive.");
         table.AddRow("[bold]--exit[/]", "Run exit dream (if enabled), teardown all layers, and exit.");
 

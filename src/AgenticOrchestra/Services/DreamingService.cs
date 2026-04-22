@@ -11,9 +11,12 @@ namespace AgenticOrchestra.Services;
 /// recurring errors, and optimization opportunities. Results are persisted
 /// as DreamRecords and injected into future sessions as learned knowledge.
 ///
+/// Dream analysis runs in an isolated "DreamAnalyzer" tab, completely separate
+/// from the live Manager conversation context.
+///
 /// Triggered either:
-///   1. Automatically when telemetry count exceeds the configured threshold
-///   2. Manually via the --dream CLI command
+///   1. Manually via the --dream CLI command (primary)
+///   2. Automatically when telemetry count exceeds threshold (if AutoDreamEnabled)
 ///   3. On session exit (if AutoDreamOnExit is enabled)
 /// </summary>
 public sealed class DreamingService
@@ -21,7 +24,8 @@ public sealed class DreamingService
     private readonly PlaywrightWebAgent _webAgent;
     private readonly SessionLoggingService _sessionLogger;
     private readonly AppConfig _config;
-    private int _lastDreamTelemetryCount = 0;
+
+    private const string DreamAgentTab = "DreamAnalyzer";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -39,29 +43,30 @@ public sealed class DreamingService
 
     /// <summary>
     /// Checks if the telemetry threshold has been met and triggers a dream cycle if so.
-    /// Should be called after each telemetry is logged.
+    /// Reads the persisted threshold marker to avoid re-analyzing on restart.
     /// </summary>
-    public async Task<bool> CheckAndDreamIfNeededAsync()
+    public async Task<bool> CheckAndDreamIfNeededAsync(CancellationToken ct = default)
     {
-        int count = _sessionLogger.GetTelemetryCount();
-        if (count - _lastDreamTelemetryCount >= _config.Dreaming.TelemetryThreshold)
+        int totalCount = await _sessionLogger.GetTelemetryCountAsync();
+        int lastDreamCount = await _sessionLogger.GetLastDreamTelemetryCountAsync();
+
+        if (totalCount - lastDreamCount >= _config.Dreaming.TelemetryThreshold)
         {
             AnsiConsole.MarkupLine($"\n[bold mediumpurple3]💤 Telemetry threshold ({_config.Dreaming.TelemetryThreshold}) reached. Initiating Dream Cycle...[/]");
-            await RunDreamCycleAsync();
-            _lastDreamTelemetryCount = _sessionLogger.GetTelemetryCount();
+            await RunDreamCycleAsync(ct);
             return true;
         }
         return false;
     }
 
     /// <summary>
-    /// Executes a full dream analysis cycle. Sends accumulated telemetries
-    /// to the Web Manager AI with a special Dream Analysis prompt and
-    /// parses the structured insights back into a DreamRecord.
+    /// Executes a full dream analysis cycle in an isolated DreamAnalyzer tab.
+    /// The Manager tab and live user conversation are never touched.
+    /// Failures are caught and logged without propagating to the caller.
     /// </summary>
-    public async Task<DreamRecord> RunDreamCycleAsync()
+    public async Task<DreamRecord> RunDreamCycleAsync(CancellationToken ct = default)
     {
-        var telemetries = _sessionLogger.GetRecentTelemetries(50); // Analyze up to 50 most recent
+        var telemetries = await _sessionLogger.GetRecentTelemetriesAsync(50);
 
         if (telemetries.Count == 0)
         {
@@ -104,10 +109,20 @@ Focus on:
                 .SpinnerStyle(Style.Parse("mediumpurple3"))
                 .StartAsync("💤 Dreaming... Analyzing execution patterns...", async ctx =>
                 {
-                    dreamResponse = await _webAgent.SendMessageAsync("Manager", dreamPrompt);
+                    // Use isolated DreamAnalyzer tab — never the live Manager tab
+                    dreamResponse = await _webAgent.SendMessageAsync(DreamAgentTab, dreamPrompt, ct);
                 });
 
             dream = ParseDreamResponse(dreamResponse, telemetries.Count);
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[dim yellow]Dream cycle cancelled.[/]");
+            dream = new DreamRecord
+            {
+                ConsolidatedInsight = "Dream analysis was cancelled by user.",
+                TelemetriesAnalyzed = telemetries.Count
+            };
         }
         catch (Exception ex)
         {
@@ -118,9 +133,16 @@ Focus on:
                 TelemetriesAnalyzed = telemetries.Count
             };
         }
+        finally
+        {
+            // Always close the DreamAnalyzer tab to free resources
+            try { await _webAgent.CloseWorkerTabAsync(DreamAgentTab); } catch { /* best-effort cleanup */ }
+        }
 
-        // Persist the dream
+        // Persist the dream and update threshold marker
         await _sessionLogger.SaveDreamRecordAsync(dream);
+        int currentCount = await _sessionLogger.GetTelemetryCountAsync();
+        await _sessionLogger.SetLastDreamTelemetryCountAsync(currentCount);
 
         AnsiConsole.MarkupLine("[bold mediumpurple3]💤 Dream cycle complete. Insights stored for next session.[/]");
         DisplayDreamSummary(dream);
@@ -166,7 +188,6 @@ Focus on:
     /// </summary>
     private static DreamRecord ParseDreamResponse(string response, int telemetriesAnalyzed)
     {
-        // Try to extract JSON from the response (may be wrapped in markdown fences)
         var jsonContent = response.Trim();
 
         // Strip markdown code fences if present
@@ -197,7 +218,6 @@ Focus on:
         }
         catch
         {
-            // If JSON parsing fails, store the entire response as the consolidated insight
             return new DreamRecord
             {
                 TelemetriesAnalyzed = telemetriesAnalyzed,
