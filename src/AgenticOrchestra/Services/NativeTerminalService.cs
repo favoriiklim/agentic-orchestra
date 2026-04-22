@@ -14,6 +14,7 @@ public sealed class NativeTerminalService : IDisposable
     private Process? _process;
     private readonly string _marker = "__COMMAND_COMPLETED__";
     private readonly bool _isWindows;
+    private readonly int _commandTimeoutSeconds;
     
     // ── REACTIVE STATE ──
     private readonly StringBuilder _accumulatedOutput = new();
@@ -23,9 +24,10 @@ public sealed class NativeTerminalService : IDisposable
     // ── SYNCHRONIZATION ──
     private readonly SemaphoreSlim _lock = new(1, 1);
 
-    public NativeTerminalService()
+    public NativeTerminalService(int commandTimeoutSeconds = 30)
     {
         _isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        _commandTimeoutSeconds = commandTimeoutSeconds;
         InitializeProcess();
     }
 
@@ -131,7 +133,7 @@ public sealed class NativeTerminalService : IDisposable
             await _process.StandardInput.FlushAsync();
 
             // We use two levels of timeout: Total (30s) and Silence (5s)
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_commandTimeoutSeconds));
             
             try
             {

@@ -7,11 +7,13 @@ namespace AgenticOrchestra.Services;
 /// <summary>
 /// Persists the history of Swarm operations to a local JSON file.
 /// Responsible for building the summarized 'Memory Context' string injected into the Head Manager.
+/// Extended for the 3-layer hierarchy: stores ManagerTelemetry records and DreamRecords.
 /// </summary>
 public sealed class SessionLoggingService
 {
     private readonly string _sessionDir;
     private readonly string _sessionFilePath;
+    private readonly string _dreamDir;
     private SessionData _currentSession;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -27,6 +29,9 @@ public sealed class SessionLoggingService
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "AgenticOrchestra", "sessions");
         _sessionFilePath = Path.Combine(_sessionDir, "latest_session.json");
+        _dreamDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "AgenticOrchestra", "dreams");
         _currentSession = new SessionData();
     }
 
@@ -36,6 +41,8 @@ public sealed class SessionLoggingService
     public async Task InitializeAsync()
     {
         Directory.CreateDirectory(_sessionDir);
+        Directory.CreateDirectory(_dreamDir);
+
         if (File.Exists(_sessionFilePath))
         {
             try
@@ -66,6 +73,60 @@ public sealed class SessionLoggingService
         await SaveSessionAsync();
     }
 
+    // ── Telemetry Persistence (3-Layer Hierarchy) ────────────────────
+
+    /// <summary>
+    /// Persists a ManagerTelemetry record from a completed orchestration cycle.
+    /// These accumulate and are later analyzed by the DreamingService.
+    /// </summary>
+    public async Task AddTelemetryAsync(ManagerTelemetry telemetry)
+    {
+        _currentSession.TelemetryLog.Add(telemetry);
+        await SaveSessionAsync();
+    }
+
+    /// <summary>
+    /// Returns the most recent N telemetry records for DreamingService analysis.
+    /// </summary>
+    public List<ManagerTelemetry> GetRecentTelemetries(int count)
+    {
+        return _currentSession.TelemetryLog
+            .TakeLast(count)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Returns the total count of unanalyzed telemetries since the last dream.
+    /// </summary>
+    public int GetTelemetryCount() => _currentSession.TelemetryLog.Count;
+
+    // ── Dream Persistence ────────────────────────────────────────────
+
+    /// <summary>
+    /// Saves a DreamRecord both to the session and as a standalone timestamped file.
+    /// </summary>
+    public async Task SaveDreamRecordAsync(DreamRecord dream)
+    {
+        _currentSession.DreamLog.Add(dream);
+        await SaveSessionAsync();
+
+        // Also save as standalone file for archival
+        var dreamFileName = $"dream_{dream.DreamTimestamp:yyyyMMdd_HHmmss}.json";
+        var dreamFilePath = Path.Combine(_dreamDir, dreamFileName);
+        var dreamJson = JsonSerializer.Serialize(dream, JsonOptions);
+        await File.WriteAllTextAsync(dreamFilePath, dreamJson);
+    }
+
+    /// <summary>
+    /// Returns the consolidated insight from the most recent dream, if any.
+    /// Used for memory injection into the Manager's system prompt.
+    /// </summary>
+    public string? GetLatestDreamInsight()
+    {
+        var latestDream = _currentSession.DreamLog.LastOrDefault();
+        return latestDream?.ConsolidatedInsight;
+    }
+
     /// <summary>
     /// Updates the global high-level summary of the project state.
     /// </summary>
@@ -83,7 +144,8 @@ public sealed class SessionLoggingService
 
     /// <summary>
     /// Constructs the Memory Injection blob.
-    /// Wraps the global summary alongside the raw data of the last 5 operations.
+    /// Wraps the global summary alongside the raw data of the last 5 operations,
+    /// plus any dream insights from previous sessions.
     /// </summary>
     public string GetMemoryInjectionString()
     {
@@ -107,6 +169,16 @@ public sealed class SessionLoggingService
         else
         {
             stringBuilder.AppendLine("No preceding operations exist in the current memory bank.");
+        }
+
+        // ── Dream Insights Injection ──
+        var dreamInsight = GetLatestDreamInsight();
+        if (!string.IsNullOrWhiteSpace(dreamInsight))
+        {
+            stringBuilder.AppendLine();
+            stringBuilder.AppendLine("### [SYSTEM MEMORY: DREAM ANALYSIS INSIGHTS] ###");
+            stringBuilder.AppendLine("The following insights were learned from analyzing your past task execution patterns:");
+            stringBuilder.AppendLine(dreamInsight);
         }
 
         return stringBuilder.ToString();

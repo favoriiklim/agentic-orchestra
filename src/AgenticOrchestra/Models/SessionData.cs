@@ -14,6 +14,18 @@ public sealed class SessionData
     /// Sequential list of all structural actions performed by the Orchestrator.
     /// </summary>
     public List<AgentOperation> Operations { get; set; } = new();
+
+    /// <summary>
+    /// Accumulated Compressed Telemetry JSONs from the Web Manager AI.
+    /// Used by DreamingService for sleep-mode pattern analysis.
+    /// </summary>
+    public List<ManagerTelemetry> TelemetryLog { get; set; } = new();
+
+    /// <summary>
+    /// History of dream analysis results from the DreamingService.
+    /// The most recent entry is injected into the Manager's system prompt.
+    /// </summary>
+    public List<DreamRecord> DreamLog { get; set; } = new();
 }
 
 /// <summary>
