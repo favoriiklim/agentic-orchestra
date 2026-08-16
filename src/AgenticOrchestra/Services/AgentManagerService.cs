@@ -263,66 +263,10 @@ Execute this task using your arsenal. Use [SPAWN_SQUAD] for tasks needing parall
             break; // No actions executed, exit loop
         }
 
-<<<<<<< Updated upstream
         if (totalIterations >= MaxTotalIterations)
         {
             AnsiConsole.MarkupLine("[bold yellow]Loop Iteration Limit Reached (15). Halting to prevent infinite loop.[/]");
             finalResponse += "\n[ABORTED: Max loop iterations reached]";
-=======
-            // 1. Process Physical Spawning Divergence
-            if (spawnMatches.Count > 0)
-            {
-                AnsiConsole.MarkupLine($"\n[bold cyan]⚡ Supervisor Divergence Sequence Initiated. Allocating {spawnMatches.Count} node(s)...[/]");
-                loopFeedBuilder.AppendLine("System Knowledge Drop (Worker Output):");
-
-                foreach (Match m in spawnMatches)
-                {
-                    var workerName = m.Groups[1].Value.Trim();
-                    var taskInstruction = m.Groups[2].Value.Trim();
-                    if (taskInstruction.EndsWith("]")) taskInstruction = taskInstruction.Substring(0, taskInstruction.Length - 1).Trim();
-
-                    string workerResponse = "";
-                    await AnsiConsole.Status()
-                        .SpinnerStyle(Style.Parse("yellow"))
-                        .StartAsync($"({workerName}) Investigating domain...", async ctx =>
-                        {
-                            workerResponse = await _webAgent.SendMessageAsync(workerName, taskInstruction);
-                        });
-
-                    await _sessionLogger.AddOperationAsync(workerName, taskInstruction, workerResponse);
-                    AnsiConsole.MarkupLine($"[green]✓ {Markup.Escape(workerName)} context retrieved.[/]");
-                    loopFeedBuilder.AppendLine($"\n--- OUTPUT FROM {workerName.ToUpper()} ---\n{workerResponse}");
-                    actionExecuted = true;
-                }
-            }
-
-            // 2. Process Shared Physical Tools (File Read, Terminal, File Write)
-            var toolResult = await _toolExecution.ExecuteToolsAsync(aiResponse);
-            if (toolResult.ActionsExecuted)
-            {
-                actionExecuted = true;
-                loopFeedBuilder.Append(toolResult.Output);
-                
-                if (toolResult.BudgetExceeded)
-                {
-                    return "ABORTED: The Head Manager reached the 5-retry limit trying to fix a persistent error.\n\n" + loopFeedBuilder.ToString();
-                }
-            }
-
-            if (actionExecuted)
-            {
-                if (_consecutiveFailures >= MaxRetryBudget)
-                {
-                    // If we hit the budget, we stop looping and return the failure info to the human
-                    return "ABORTED: The Head Manager reached the 5-retry limit trying to fix a persistent error.\n\n" + loopFeedBuilder.ToString();
-                }
-
-                currentPrompt = "System Outcomes:\n" + loopFeedBuilder.ToString() + "\nEvaluate results. If you are done, respond in plain text to the user. If you need to take more physical actions, use exactly ONE bracket tool.";
-                continue; 
-            }
-
-            break;
->>>>>>> Stashed changes
         }
 
         return finalResponse;

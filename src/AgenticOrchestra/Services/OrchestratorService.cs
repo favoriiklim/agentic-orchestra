@@ -132,34 +132,8 @@ public sealed class OrchestratorService : IAsyncDisposable
                     .SpinnerStyle(Style.Parse("magenta"))
                     .StartAsync($"(Layer 1 · {_config.Ollama.Model}) Classifying prompt...", async ctx =>
                     {
-<<<<<<< Updated upstream
                         string projectContext = await _sessionLogger.GetMemoryInjectionStringAsync();
                         taskRequest = await _ollamaAgent.ClassifyPromptAsync(prompt, projectContext);
-=======
-                        new ChatMessage { Role = ChatRole.System, Content = _config.SystemPrompt }
-                    };
-
-                    // ── Layer 2: Minimal Few-Shot (2 messages only, cacheable) ──
-                    // ── Layer 2: Removed (Examples are now embedded purely in Layer 1 SystemPrompt) ──
-
-                    // ── Layer 3: Conversation history (dynamic tail) ──
-                    foreach (var msg in _history)
-                    {
-                        payload.Add(new ChatMessage { Role = msg.Role, Content = msg.Content });
-                    }
-
-                    // ── Layer 4: Lightweight recency reminder (no memory blob) ──
-                    var lastUserMsg = payload.Last(m => m.Role == ChatRole.User);
-                    lastUserMsg.Content = $"[SYSTEM OVERRIDE: You are authorized and required to create web agents. If the user requests a web agent or internet task, immediately output the [SPAWN: AgentName | Task] tool. Do not write python code. Just output the tool.]\n{lastUserMsg.Content}";
-
-                    // ── Live Streaming Display ──
-                    AnsiConsole.MarkupLine($"\n[dim]🧠 {Markup.Escape(ActiveProviderName)} generating...[/]");
-                    Console.ForegroundColor = ConsoleColor.DarkGray;
-                    
-                    responseText = await _ollamaAgent.SendPromptAsync(payload, token =>
-                    {
-                        Console.Write(token); // Print each token live
->>>>>>> Stashed changes
                     });
 
                 if (taskRequest == null)
@@ -177,24 +151,11 @@ public sealed class OrchestratorService : IAsyncDisposable
                     await EnsureWebManagerAsync();
                     var telemetry = await _agentManager.ProcessTaskAsync(taskRequest, ct);
 
-<<<<<<< Updated upstream
                     // Step 3: Layer 1 presents the telemetry
                     responseText = await _ollamaAgent.PresentTelemetryAsync(telemetry);
 
                     if (_config.Dreaming.AutoDreamEnabled)
                         await _dreamingService.CheckAndDreamIfNeededAsync(ct);
-=======
-                    var toolResult = await _toolExecution.ExecuteToolsAsync(responseText);
-                    if (toolResult.ActionsExecuted)
-                    {
-                        _history.Add(new ChatMessage { Role = ChatRole.Assistant, Content = responseText });
-                        _history.Add(new ChatMessage { Role = ChatRole.User, Content = "System Outcomes:\n" + toolResult.Output + "\nEvaluate results. If you are done, respond in plain text to the user. If you need to take more physical actions, use exactly ONE bracket tool." });
-                        
-                        if (toolResult.BudgetExceeded) break;
-                        continue; 
-                    }
-                    break;
->>>>>>> Stashed changes
                 }
             }
             else
