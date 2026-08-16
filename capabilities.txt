@@ -1,0 +1,1 @@
+Features: Directory Listing, File Reading, File Writing, Terminal Command Execution

@@ -221,6 +221,36 @@ public sealed class ToolExecutionService : IDisposable
             actionExecuted = true;
         }
 
+        // ═══════════════════════════════════════════════════════════
+        // 7. SYNTAX ERROR DETECTION — catches malformed bracket tokens
+        // ═══════════════════════════════════════════════════════════
+        if (!actionExecuted)
+        {
+            // Detect malformed [FILE_WRITE:path]content (missing | separator)
+            if (Regex.IsMatch(aiResponse, @"\[FILE_WRITE:\s*[^\|\]]+\]", RegexOptions.IgnoreCase))
+            {
+                AnsiConsole.MarkupLine("[bold red]⚠ SYNTAX ERROR detected:[/] [dim]FILE_WRITE missing '|' separator[/]");
+                loopFeedBuilder.AppendLine("SYNTAX ERROR: You attempted [FILE_WRITE] but forgot the '|' separator. Correct format: [FILE_WRITE: filepath | content]. Try again with the correct syntax.");
+                actionExecuted = true;
+            }
+
+            // Detect malformed [SPAWN_LOCAL_WORKER:persona] (missing | separator)
+            if (Regex.IsMatch(aiResponse, @"\[SPAWN_LOCAL_WORKER:\s*[^\|\]]+\]", RegexOptions.IgnoreCase))
+            {
+                AnsiConsole.MarkupLine("[bold red]⚠ SYNTAX ERROR detected:[/] [dim]SPAWN_LOCAL_WORKER missing '|' separator[/]");
+                loopFeedBuilder.AppendLine("SYNTAX ERROR: You attempted [SPAWN_LOCAL_WORKER] but forgot the '|' separator. Correct format: [SPAWN_LOCAL_WORKER: Persona | Task]. Try again.");
+                actionExecuted = true;
+            }
+
+            // Detect malformed [SPAWN:name] (missing | separator)
+            if (Regex.IsMatch(aiResponse, @"\[SPAWN:\s*[^\|\]]+\]", RegexOptions.IgnoreCase))
+            {
+                AnsiConsole.MarkupLine("[bold red]⚠ SYNTAX ERROR detected:[/] [dim]SPAWN missing '|' separator[/]");
+                loopFeedBuilder.AppendLine("SYNTAX ERROR: You attempted [SPAWN] but forgot the '|' separator. Correct format: [SPAWN: AgentName | Task]. Try again.");
+                actionExecuted = true;
+            }
+        }
+
         return new ToolExecutionResult(loopFeedBuilder.ToString(), actionExecuted, false);
     }
 
