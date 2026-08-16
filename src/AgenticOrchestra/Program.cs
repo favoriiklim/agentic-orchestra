@@ -1,5 +1,7 @@
+using System.Reflection;
 using System.Text;
 using Spectre.Console;
+using AgenticOrchestra.Models;
 using AgenticOrchestra.Services;
 using AgenticOrchestra.UI;
 
@@ -12,6 +14,58 @@ public static class Program
         // Enable UTF-8 for rich Spectre.Console rendering (emojis, box-drawing, etc.)
         Console.InputEncoding = Encoding.UTF8;
         Console.OutputEncoding = Encoding.UTF8;
+
+        // ── Argument handling ───────────────────────────────────────
+        // Informational flags answer and exit before any heavy startup work
+        // (config write, Playwright download), so `orchestra --help` is instant.
+        ApprovalMode? approvalOverride = null;
+        bool? headlessOverride = null;
+
+        foreach (var arg in args)
+        {
+            switch (arg.ToLowerInvariant())
+            {
+                case "-h":
+                case "--help":
+                    PrintUsage();
+                    return 0;
+
+                case "-v":
+                case "--version":
+                    AnsiConsole.WriteLine(GetVersion());
+                    return 0;
+
+                case "--config-path":
+                    AnsiConsole.WriteLine(ConfigService.ConfigFilePath);
+                    return 0;
+
+                case "--safe":
+                    approvalOverride = ApprovalMode.ReadOnly;
+                    break;
+
+                case "--ask":
+                    approvalOverride = ApprovalMode.Ask;
+                    break;
+
+                case "--auto":
+                    approvalOverride = ApprovalMode.Auto;
+                    break;
+
+                case "--headless":
+                    headlessOverride = true;
+                    break;
+
+                case "--headed":
+                    headlessOverride = false;
+                    break;
+
+                default:
+                    AnsiConsole.MarkupLine($"[red]Unknown option:[/] {Markup.Escape(arg)}");
+                    AnsiConsole.WriteLine();
+                    PrintUsage();
+                    return 2;
+            }
+        }
 
         try
         {
@@ -32,8 +86,22 @@ public static class Program
                     return cfg;
                 });
 
+            // Command-line overrides apply to this run only — never written back to disk.
+            if (approvalOverride is { } mode)
+            {
+                config.Safety.ApprovalMode = mode;
+                AnsiConsole.MarkupLine($"[dim]Safety override for this run:[/] {UIHelper.DescribeApprovalMode(mode)}");
+            }
+
+            if (headlessOverride is { } headless)
+            {
+                config.WebFallback.Headless = headless;
+                AnsiConsole.MarkupLine($"[dim]Browser override for this run:[/] {(headless ? "headless" : "headed")}");
+            }
+
             AnsiConsole.MarkupLine(
                 $"[dim]Config:[/] [link={ConfigService.ConfigFilePath}]{ConfigService.ConfigFilePath}[/]");
+            AnsiConsole.MarkupLine($"[dim]Safety:[/] {UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode)}");
             AnsiConsole.WriteLine();
 
             // ── First Run Setup ─────────────────────────────────────
@@ -70,6 +138,39 @@ public static class Program
             AnsiConsole.WriteException(ex, ExceptionFormats.ShortenEverything);
             return 1;
         }
+    }
+
+    private static string GetVersion() =>
+        Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            .Split('+')[0]
+        ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString()
+        ?? "unknown";
+
+    private static void PrintUsage()
+    {
+        AnsiConsole.MarkupLine($"[bold cornflowerblue]Agentic Orchestra[/] [dim]v{GetVersion()}[/]");
+        AnsiConsole.MarkupLine("[dim]A CLI orchestrator that drives local and web-based AIs as one team.[/]");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold]Usage:[/] orchestra [[options]]");
+        AnsiConsole.WriteLine();
+
+        var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey);
+        table.AddColumn("[cyan]Option[/]");
+        table.AddColumn("Description");
+        table.AddRow("[bold]-h, --help[/]", "Show this help and exit.");
+        table.AddRow("[bold]-v, --version[/]", "Print the version and exit.");
+        table.AddRow("[bold]--config-path[/]", "Print the config.json location and exit.");
+        table.AddRow("[bold]--ask[/]", "Confirm every command and file write (default).");
+        table.AddRow("[bold]--auto[/]", "Run actions without asking. The blocklist still applies.");
+        table.AddRow("[bold]--safe[/]", "Read-only: never execute commands or write files.");
+        table.AddRow("[bold]--headed[/]", "Show the automated browser window.");
+        table.AddRow("[bold]--headless[/]", "Hide the automated browser window.");
+        AnsiConsole.Write(table);
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[dim]Safety and browser options override config.json for the current run only.[/]");
+        AnsiConsole.MarkupLine("[dim]Run with no options for the interactive menu; use --help inside chat for session commands.[/]");
     }
 
     /// <summary>

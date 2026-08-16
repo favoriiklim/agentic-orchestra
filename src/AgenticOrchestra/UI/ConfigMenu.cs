@@ -53,12 +53,48 @@ public static class ConfigMenu
         // 4. Web Fallback Headless Mode
         config.WebFallback.Headless = AnsiConsole.Confirm("Run web fallback in Headless mode (hidden browser)?", config.WebFallback.Headless);
 
-        // 5. System Prompt
+        // 5. Safety — the boundary between AI suggestions and the user's machine
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[dim]System Prompt (leave empty to keep current):[/]");
-        AnsiConsole.MarkupLine($"[dim]Current: {config.SystemPrompt}[/]");
+        AnsiConsole.Write(new Rule("[dim]🛡  Safety[/]").LeftJustified());
+
+        config.Safety.ApprovalMode = AnsiConsole.Prompt(
+            new SelectionPrompt<ApprovalMode>()
+                .Title("Approval mode for terminal commands and file writes:")
+                .UseConverter(mode => mode switch
+                {
+                    ApprovalMode.Ask => "Ask    — confirm each action (recommended)",
+                    ApprovalMode.Auto => "Auto   — run without asking (blocklist still applies)",
+                    _ => "ReadOnly — never execute or write; inspection only"
+                })
+                .AddChoices(ApprovalMode.Ask, ApprovalMode.Auto, ApprovalMode.ReadOnly));
+
+        config.Safety.ConfineFileWritesToWorkspace = AnsiConsole.Confirm(
+            "Confine file writes to the workspace directory?",
+            config.Safety.ConfineFileWritesToWorkspace);
+
+        config.Safety.WorkspaceRoot = AnsiConsole.Prompt(
+            new TextPrompt<string>("Workspace root [dim](empty = current directory)[/]:")
+                .DefaultValue(config.Safety.WorkspaceRoot)
+                .AllowEmpty());
+
+        config.Safety.NormalizeCodeBlocks = AnsiConsole.Confirm(
+            "Treat markdown code blocks in AI replies as executable commands? [dim](risky)[/]",
+            config.Safety.NormalizeCodeBlocks);
+
+        // 6. System Prompt
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Rule("[dim]System Prompt[/]").LeftJustified());
+        AnsiConsole.MarkupLine("[dim]Leave empty to keep the current prompt.[/]");
+
+        // Escaped: the prompt contains bracket tokens like [TERMINAL_EXEC: cmd]
+        // that Spectre would otherwise parse as markup and throw on.
+        var preview = config.SystemPrompt.Length > 400
+            ? config.SystemPrompt[..400] + $"… (+{config.SystemPrompt.Length - 400} chars)"
+            : config.SystemPrompt;
+        AnsiConsole.MarkupLine($"[dim]Current:\n{Markup.Escape(preview)}[/]");
+
         var newSystemPrompt = AnsiConsole.Prompt(new TextPrompt<string>(">").AllowEmpty());
-        
+
         if (!string.IsNullOrWhiteSpace(newSystemPrompt))
         {
             config.SystemPrompt = newSystemPrompt;

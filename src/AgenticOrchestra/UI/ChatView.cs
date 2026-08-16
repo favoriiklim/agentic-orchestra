@@ -199,6 +199,11 @@ public static class ChatView
         
         AnsiConsole.Write(tree);
 
+        // Safety indicator — what the AI is allowed to do to this machine
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[bold]Safety:[/] {UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode)}");
+        AnsiConsole.MarkupLine("[dim]Change it in Settings, or start with --safe / --ask / --auto.[/]");
+
         // Mode indicator
         AnsiConsole.WriteLine();
         if (orchestrator.IsHardFallback)

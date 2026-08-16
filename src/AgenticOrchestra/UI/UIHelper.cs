@@ -1,4 +1,5 @@
 using Spectre.Console;
+using AgenticOrchestra.Models;
 
 namespace AgenticOrchestra.UI;
 
@@ -23,4 +24,15 @@ public static class UIHelper
             .LeftJustified());
         AnsiConsole.WriteLine();
     }
+
+    /// <summary>
+    /// Renders an approval mode as coloured markup, so the current level of
+    /// protection is visible wherever the user is in the app.
+    /// </summary>
+    public static string DescribeApprovalMode(ApprovalMode mode) => mode switch
+    {
+        ApprovalMode.Ask => "[green]Ask[/] [dim]— confirm every command & file write[/]",
+        ApprovalMode.Auto => "[bold yellow]Auto[/] [dim]— runs without asking (blocklist still applies)[/]",
+        _ => "[cyan]ReadOnly[/] [dim]— inspection only, nothing is executed[/]"
+    };
 }

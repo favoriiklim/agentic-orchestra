@@ -20,6 +20,7 @@ public static class MainMenu
             AnsiConsole.MarkupLine($"Web Fallback URL: [blue]{config.WebFallback.TargetUrl}[/]");
             AnsiConsole.MarkupLine($"Squad: [cyan]Innovator({config.Squad.InnovatorPlatform})[/] + [cyan]Implementer({config.Squad.ImplementerPlatform})[/] → [yellow]Critic({config.Squad.CriticPlatform})[/]");
             AnsiConsole.MarkupLine($"Dream Threshold: [mediumpurple3]{config.Dreaming.TelemetryThreshold} telemetries[/]");
+            AnsiConsole.MarkupLine($"Safety: {UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode)}");
             AnsiConsole.WriteLine();
 
             var choice = AnsiConsole.Prompt(
@@ -118,12 +119,34 @@ public static class MainMenu
             .AddRow("[b]Dream Threshold[/]", $"{config.Dreaming.TelemetryThreshold} telemetries")
             .AddRow("[b]Auto Dream on Exit[/]", config.Dreaming.AutoDreamOnExit ? "[green]Enabled[/]" : "[red]Disabled[/]");
 
+        var guard = new SafetyGuard(config.Safety);
+        var safetyGrid = new Grid()
+            .AddColumn(new GridColumn().NoWrap().PadRight(4))
+            .AddColumn()
+            .AddRow("[b]Approval Mode[/]", UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode))
+            .AddRow("[b]Workspace Root[/]", Markup.Escape(guard.WorkspaceRoot))
+            .AddRow("[b]Writes Confined[/]", config.Safety.ConfineFileWritesToWorkspace
+                ? "[green]Yes — writes outside the workspace are refused[/]"
+                : "[bold red]No — the AI may write anywhere on disk[/]")
+            .AddRow("[b]Code Blocks Executed[/]", config.Safety.NormalizeCodeBlocks
+                ? "[bold yellow]Yes — markdown blocks become commands[/]"
+                : "[green]No[/]")
+            .AddRow("[b]Blocked Patterns[/]", $"{config.Safety.BlockedCommandPatterns.Count} rules (enforced in every mode)");
+
         AnsiConsole.Write(new Panel(grid)
             {
                 Header = new PanelHeader("Agentic Orchestra · 3-Layer Hierarchy"),
                 Border = BoxBorder.Rounded,
                 Padding = new Padding(1, 1, 1, 1)
             });
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Panel(safetyGrid)
+            {
+                Header = new PanelHeader("🛡  Safety"),
+                Border = BoxBorder.Rounded,
+                Padding = new Padding(1, 1, 1, 1)
+            }.BorderColor(config.Safety.ApprovalMode == ApprovalMode.Auto ? Color.Orange1 : Color.Grey));
 
         // Squad Configuration
         AnsiConsole.WriteLine();
