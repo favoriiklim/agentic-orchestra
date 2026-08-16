@@ -35,22 +35,76 @@ public sealed class OllamaAgent
     }
 
     /// <summary>
-    /// Checks if the Ollama endpoint is reachable and responsive.
-    /// Uses a shorter timeout to prevent long delays during fallback.
+    /// Checks whether Layer 1 can actually serve a request.
+    ///
+    /// A reachable server is not enough: Ollama answers /api/version happily while
+    /// holding zero models, and then fails every /api/chat with 404. Treating that
+    /// as "available" sent the pipeline into normal mode and crashed the app, so
+    /// the configured model must be present too.
     /// </summary>
     public async Task<bool> IsAvailableAsync()
+    {
+        var health = await CheckHealthAsync();
+        return health.IsUsable;
+    }
+
+    /// <summary>
+    /// Probes the local Ollama instance and reports exactly what is wrong,
+    /// so the UI can tell the user what to do about it.
+    /// </summary>
+    public async Task<OllamaHealth> CheckHealthAsync()
     {
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             var response = await _httpClient.GetAsync("/api/version", cts.Token);
-            return response.IsSuccessStatusCode;
+            if (!response.IsSuccessStatusCode)
+                return OllamaHealth.Down($"Ollama replied {(int)response.StatusCode} to /api/version.");
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // Network error, connection refused, or timeout
-            return false;
+            return OllamaHealth.Down($"Cannot reach Ollama at {_config.Ollama.Endpoint} ({ex.GetType().Name}).");
         }
+
+        var models = await GetModelsAsync();
+
+        if (models.Count == 0)
+        {
+            return new OllamaHealth(
+                ServerUp: true,
+                ModelPresent: false,
+                InstalledModels: models,
+                Message: $"Ollama is running but has no models installed. Run: ollama pull {_config.Ollama.Model}");
+        }
+
+        if (!ModelMatches(models, _config.Ollama.Model))
+        {
+            return new OllamaHealth(
+                ServerUp: true,
+                ModelPresent: false,
+                InstalledModels: models,
+                Message: $"Model '{_config.Ollama.Model}' is not installed. " +
+                         $"Run: ollama pull {_config.Ollama.Model} — or pick one of: {string.Join(", ", models)}");
+        }
+
+        return new OllamaHealth(true, true, models, "Ready.");
+    }
+
+    /// <summary>
+    /// Compares a configured model name against installed tags. Ollama reports
+    /// "llama3.2:latest", so a bare "llama3.2" has to match it.
+    /// </summary>
+    internal static bool ModelMatches(IEnumerable<string> installed, string configured)
+    {
+        if (string.IsNullOrWhiteSpace(configured)) return false;
+
+        var wanted = configured.Trim();
+        var wantedWithTag = wanted.Contains(':') ? wanted : wanted + ":latest";
+
+        return installed.Any(m =>
+            m.Equals(wanted, StringComparison.OrdinalIgnoreCase) ||
+            m.Equals(wantedWithTag, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>
@@ -88,12 +142,64 @@ public sealed class OllamaAgent
             stream = false // We request the entire response object at once for simplicity in MVP
         };
 
-        var response = await _httpClient.PostAsJsonAsync("/api/chat", requestBody);
-        response.EnsureSuccessStatusCode();
+        HttpResponseMessage response;
+        try
+        {
+            response = await _httpClient.PostAsJsonAsync("/api/chat", requestBody);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            throw new OllamaException(
+                $"Could not reach Ollama at {_config.Ollama.Endpoint}. Is it running? ({ex.Message})", ex);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            // Ollama explains itself in the body ({"error":"model 'x' not found"});
+            // EnsureSuccessStatusCode would throw that detail away.
+            var body = await SafeReadBodyAsync(response);
+            throw new OllamaException(DescribeFailure(response.StatusCode, body));
+        }
 
         var responseData = await response.Content.ReadFromJsonAsync<OllamaChatResponse>();
-        
+
         return responseData?.Message?.Content ?? string.Empty;
+    }
+
+    private static async Task<string> SafeReadBodyAsync(HttpResponseMessage response)
+    {
+        try { return await response.Content.ReadAsStringAsync(); }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>Turns an Ollama error response into something the user can act on.</summary>
+    private string DescribeFailure(System.Net.HttpStatusCode status, string body)
+    {
+        var detail = ExtractError(body);
+
+        if (status == System.Net.HttpStatusCode.NotFound)
+        {
+            return $"Ollama does not have the model '{_config.Ollama.Model}'. " +
+                   $"Install it with:  ollama pull {_config.Ollama.Model}" +
+                   (string.IsNullOrWhiteSpace(detail) ? "" : $"\nOllama said: {detail}");
+        }
+
+        return $"Ollama returned {(int)status} ({status})." +
+               (string.IsNullOrWhiteSpace(detail) ? "" : $" {detail}");
+    }
+
+    private static string ExtractError(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return string.Empty;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("error", out var err))
+                return err.GetString() ?? string.Empty;
+        }
+        catch (JsonException) { /* not JSON — fall through */ }
+
+        return body.Length > 300 ? body[..300] : body;
     }
 
     // ── Layer 1 Specialized Methods (3-Layer Hierarchy) ────────────
@@ -224,6 +330,31 @@ RULES:
     {
         return await SendPromptAsync(history);
     }
+}
+
+/// <summary>
+/// Raised when the local Ollama instance cannot serve a request. Carries a
+/// message written for the user, not a stack trace.
+/// </summary>
+public sealed class OllamaException : Exception
+{
+    public OllamaException(string message, Exception? inner = null) : base(message, inner) { }
+}
+
+/// <summary>
+/// The result of probing Ollama: whether the server answers, and whether the
+/// configured model is actually installed.
+/// </summary>
+public sealed record OllamaHealth(
+    bool ServerUp,
+    bool ModelPresent,
+    List<string> InstalledModels,
+    string Message)
+{
+    /// <summary>True only when Layer 1 can genuinely handle a prompt.</summary>
+    public bool IsUsable => ServerUp && ModelPresent;
+
+    public static OllamaHealth Down(string message) => new(false, false, new List<string>(), message);
 }
 
 // ── Models for internal JSON deserialization ──

@@ -104,26 +104,43 @@ public static class Program
             AnsiConsole.MarkupLine($"[dim]Safety:[/] {UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode)}");
             AnsiConsole.WriteLine();
 
-            // ── First Run Setup ─────────────────────────────────────
-            if (isFirstRun)
+            // ── Layer 1 health check ────────────────────────────────
+            // Surfaced at startup rather than on the first prompt: a running
+            // Ollama with no models used to look fine and then fail mid-chat.
+            var ollamaAgent = new OllamaAgent(config);
+            var health = await AnsiConsole.Status()
+                .SpinnerStyle(Style.Parse("magenta"))
+                .StartAsync("[magenta]Checking local AI (Layer 1)...[/]", async _ => await ollamaAgent.CheckHealthAsync());
+
+            if (isFirstRun && health.InstalledModels.Count > 0)
             {
-                AnsiConsole.MarkupLine("[bold yellow]First Run Detected: Fetching local models...[/]");
-                var agent = new OllamaAgent(config);
-                var models = await agent.GetModelsAsync();
+                var selectedModel = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title("Select your preferred default Ollama model:")
+                        .AddChoices(health.InstalledModels));
 
-                if (models.Any())
+                config.Ollama.Model = selectedModel;
+                await configService.SaveAsync(config);
+                AnsiConsole.MarkupLine($"[green]Default model set to {selectedModel}.[/]");
+                health = await ollamaAgent.CheckHealthAsync();
+            }
+
+            if (health.IsUsable)
+            {
+                AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [green]ready[/] [dim]({Markup.Escape(config.Ollama.Model)})[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [yellow]unavailable[/] [dim]— {Markup.Escape(health.Message)}[/]");
+                AnsiConsole.MarkupLine("[dim]The app will run in hard-fallback mode, talking to the web AI directly.[/]");
+
+                if (health.ServerUp && health.InstalledModels.Count > 0)
                 {
-                    var selectedModel = AnsiConsole.Prompt(
-                        new SelectionPrompt<string>()
-                            .Title("Select your preferred default Ollama model:")
-                            .AddChoices(models));
-
-                    config.Ollama.Model = selectedModel;
-                    await configService.SaveAsync(config);
-                    AnsiConsole.MarkupLine($"[green]Default model set to {selectedModel}.[/]");
-                    AnsiConsole.WriteLine();
+                    AnsiConsole.MarkupLine($"[dim]Installed models:[/] {Markup.Escape(string.Join(", ", health.InstalledModels))}");
+                    AnsiConsole.MarkupLine("[dim]Pick one from Settings to enable the full pipeline.[/]");
                 }
             }
+            AnsiConsole.WriteLine();
 
             // ── Ensure Playwright Browsers ──────────────────────────
             await EnsurePlaywrightBrowsersAsync();

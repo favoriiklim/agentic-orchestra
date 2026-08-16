@@ -116,73 +116,29 @@ public sealed class OrchestratorService : IAsyncDisposable
 
         try
         {
-            // ── Availability Check: Is Layer 1 (Ollama) online? ──────
-            bool ollamaAvailable = await _ollamaAgent.IsAvailableAsync();
+            // ── Availability Check: can Layer 1 actually serve this? ──
+            var health = await _ollamaAgent.CheckHealthAsync();
 
-            if (ollamaAvailable)
+            if (health.IsUsable)
             {
-                // ═══════════════════════════════════════════════════════
-                //  NORMAL MODE: Full 3-Layer Chain
-                // ═══════════════════════════════════════════════════════
-                IsHardFallback = false;
-
-                // Step 1: Layer 1 classifies the prompt
-                ManagerTaskRequest? taskRequest = null;
-                await AnsiConsole.Status()
-                    .SpinnerStyle(Style.Parse("magenta"))
-                    .StartAsync($"(Layer 1 · {_config.Ollama.Model}) Classifying prompt...", async ctx =>
-                    {
-                        string projectContext = await _sessionLogger.GetMemoryInjectionStringAsync();
-                        taskRequest = await _ollamaAgent.ClassifyPromptAsync(prompt, projectContext);
-                    });
-
-                if (taskRequest == null)
+                try
                 {
-                    // ── SIMPLE PROMPT: Handle locally ───────────────────
-                    IsLocalOnly = true;
-                    responseText = await _ollamaAgent.RespondDirectlyAsync(prompt, _history);
+                    responseText = await RunNormalPipelineAsync(prompt, ct);
                 }
-                else
+                catch (OllamaException ex)
                 {
-                    // ── COMPLEX PROMPT: Delegate to Layer 2 + Squad ─────
-                    IsLocalOnly = false;
-                    AnsiConsole.MarkupLine($"[dim]Task classified as [cyan]{taskRequest.TaskCategory}[/]. Delegating to Web Manager AI (Layer 2)...[/]");
+                    // Layer 1 died mid-flight (model deleted, server stopped, OOM).
+                    // Degrading beats crashing: the user still gets an answer.
+                    AnsiConsole.MarkupLine($"[bold yellow]⚠️  Layer 1 failed mid-task:[/] {Markup.Escape(ex.Message)}");
+                    AnsiConsole.MarkupLine("[dim]Falling back to the Web Manager AI for this prompt.[/]");
+                    AnsiConsole.WriteLine();
 
-                    await EnsureWebManagerAsync();
-                    var telemetry = await _agentManager.ProcessTaskAsync(taskRequest, ct);
-
-                    // Step 3: Layer 1 presents the telemetry
-                    responseText = await _ollamaAgent.PresentTelemetryAsync(telemetry);
-
-                    if (_config.Dreaming.AutoDreamEnabled)
-                        await _dreamingService.CheckAndDreamIfNeededAsync(ct);
+                    responseText = await RunHardFallbackAsync(prompt, ct, announce: false);
                 }
             }
             else
             {
-                // ═══════════════════════════════════════════════════════
-                //  HARD FALLBACK MODE: Skip Layer 1, direct to Layer 2
-                //  The system MUST NOT crash or lock up when Ollama is down.
-                // ═══════════════════════════════════════════════════════
-                IsHardFallback = true;
-                IsLocalOnly = false;
-
-                if (!_webManagerInitialized)
-                {
-                    AnsiConsole.MarkupLine("[bold yellow]⚠️  HARD FALLBACK MODE: Local AI (Ollama) is unreachable.[/]");
-                    AnsiConsole.MarkupLine("[dim]Bypassing Layer 1. Connecting you directly to the Web Manager AI (Layer 2).[/]");
-                    AnsiConsole.MarkupLine("[dim]The system will check Ollama availability on each prompt. Normal mode resumes when Ollama is back online.[/]");
-                    AnsiConsole.WriteLine();
-                }
-
-                await EnsureWebManagerAsync();
-
-                // Direct pipeline: raw user text → Manager → raw response
-                // Manager can still spawn Squad if needed
-                responseText = await _agentManager.ProcessDirectAsync(prompt, ct);
-
-                if (_config.Dreaming.AutoDreamEnabled)
-                    await _dreamingService.CheckAndDreamIfNeededAsync(ct);
+                responseText = await RunHardFallbackAsync(prompt, ct, announce: true, reason: health.Message);
             }
         }
         catch (OperationCanceledException)
@@ -193,6 +149,82 @@ public sealed class OrchestratorService : IAsyncDisposable
         }
 
         _history.Add(new ChatMessage { Role = ChatRole.Assistant, Content = responseText });
+        return responseText;
+    }
+
+    /// <summary>
+    /// NORMAL MODE: the full 3-layer chain.
+    /// User → Ollama (classify) → Web Manager (+ Squad) → Ollama (present) → User.
+    /// </summary>
+    private async Task<string> RunNormalPipelineAsync(string prompt, CancellationToken ct)
+    {
+        IsHardFallback = false;
+
+        // Step 1: Layer 1 classifies the prompt
+        ManagerTaskRequest? taskRequest = null;
+        await AnsiConsole.Status()
+            .SpinnerStyle(Style.Parse("magenta"))
+            .StartAsync($"(Layer 1 · {_config.Ollama.Model}) Classifying prompt...", async ctx =>
+            {
+                string projectContext = await _sessionLogger.GetMemoryInjectionStringAsync();
+                taskRequest = await _ollamaAgent.ClassifyPromptAsync(prompt, projectContext);
+            });
+
+        if (taskRequest == null)
+        {
+            // ── SIMPLE PROMPT: Handle locally ───────────────────
+            IsLocalOnly = true;
+            return await _ollamaAgent.RespondDirectlyAsync(prompt, _history);
+        }
+
+        // ── COMPLEX PROMPT: Delegate to Layer 2 + Squad ─────
+        IsLocalOnly = false;
+        AnsiConsole.MarkupLine($"[dim]Task classified as [cyan]{taskRequest.TaskCategory}[/]. Delegating to Web Manager AI (Layer 2)...[/]");
+
+        await EnsureWebManagerAsync();
+        var telemetry = await _agentManager.ProcessTaskAsync(taskRequest, ct);
+
+        // Step 3: Layer 1 presents the telemetry
+        var responseText = await _ollamaAgent.PresentTelemetryAsync(telemetry);
+
+        if (_config.Dreaming.AutoDreamEnabled)
+            await _dreamingService.CheckAndDreamIfNeededAsync(ct);
+
+        return responseText;
+    }
+
+    /// <summary>
+    /// HARD FALLBACK MODE: skip Layer 1, talk to the Web Manager directly.
+    /// The system must never crash or lock up because the local model is missing.
+    /// </summary>
+    private async Task<string> RunHardFallbackAsync(
+        string prompt,
+        CancellationToken ct,
+        bool announce,
+        string? reason = null)
+    {
+        IsHardFallback = true;
+        IsLocalOnly = false;
+
+        if (announce && !_webManagerInitialized)
+        {
+            AnsiConsole.MarkupLine("[bold yellow]⚠️  HARD FALLBACK MODE: Layer 1 (local AI) is unavailable.[/]");
+            if (!string.IsNullOrWhiteSpace(reason))
+                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(reason)}[/]");
+            AnsiConsole.MarkupLine("[dim]Bypassing Layer 1. Connecting you directly to the Web Manager AI (Layer 2).[/]");
+            AnsiConsole.MarkupLine("[dim]Availability is rechecked on every prompt — normal mode resumes automatically.[/]");
+            AnsiConsole.WriteLine();
+        }
+
+        await EnsureWebManagerAsync();
+
+        // Direct pipeline: raw user text → Manager → raw response
+        // Manager can still spawn Squad if needed
+        var responseText = await _agentManager.ProcessDirectAsync(prompt, ct);
+
+        if (_config.Dreaming.AutoDreamEnabled)
+            await _dreamingService.CheckAndDreamIfNeededAsync(ct);
+
         return responseText;
     }
 

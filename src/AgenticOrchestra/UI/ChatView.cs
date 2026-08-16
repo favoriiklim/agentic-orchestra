@@ -133,7 +133,26 @@ public static class ChatView
             }
 
             // ── Core 3-Layer Pipeline Execution ──
-            string response = await orchestrator.ProcessPromptAsync(prompt);
+            // A single failed prompt must not end the session: report it and
+            // keep the loop alive so the user can fix the cause and retry.
+            string response;
+            try
+            {
+                response = await orchestrator.ProcessPromptAsync(prompt);
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.WriteLine();
+                AnsiConsole.Write(new Panel(new Markup($"[red]{Markup.Escape(ex.Message)}[/]"))
+                {
+                    Header = new PanelHeader(" ⚠  This prompt failed ", Justify.Left),
+                    Border = BoxBorder.Rounded,
+                    Padding = new Padding(1, 1, 1, 1)
+                }.BorderColor(Color.Red));
+                AnsiConsole.MarkupLine("[dim]The session is still running. Fix the cause above and try again, or use [bold]--help[/].[/]");
+                AnsiConsole.WriteLine();
+                continue;
+            }
 
             var panel = new Panel(new Markup(Markup.Escape(response)))
             {

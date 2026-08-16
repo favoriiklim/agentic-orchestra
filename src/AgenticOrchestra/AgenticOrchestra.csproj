@@ -28,6 +28,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Lets the test project cover internal helpers without widening the public API. -->
+    <InternalsVisibleTo Include="AgenticOrchestra.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.49.*" />
     <PackageReference Include="Microsoft.Playwright" Version="1.49.*" />
   </ItemGroup>
