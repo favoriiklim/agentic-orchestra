@@ -14,6 +14,7 @@ public sealed class AppConfig()
     public DreamingSettings Dreaming { get; set; } = new();
     public SquadSettings Squad { get; set; } = new();
     public TimeoutSettings Timeouts { get; set; } = new();
+    public SafetySettings Safety { get; set; } = new();
     public List<AiPlatformConfig> Platforms { get; set; } = AiPlatformConfig.Defaults();
     public int IdleTimeoutMinutes { get; set; } = 2; // Threshold for dreaming mode
 
@@ -272,6 +273,91 @@ public sealed class SquadSettings
 
     /// <summary>Maximum times the Critic can reject work before forcing approval.</summary>
     public int MaxCriticRetries { get; set; } = 3;
+}
+
+/// <summary>
+/// How the orchestrator treats tool calls that physically change the machine.
+/// </summary>
+public enum ApprovalMode
+{
+    /// <summary>Prompt the human before every terminal command and file write. Default.</summary>
+    Ask,
+
+    /// <summary>Execute without prompting. Blocked patterns are still enforced.</summary>
+    Auto,
+
+    /// <summary>Refuse every terminal command and file write; reads still work.</summary>
+    ReadOnly
+}
+
+/// <summary>
+/// Guardrails for physical tool execution.
+///
+/// The Web Manager AI runs inside a third-party web page, so its output is
+/// untrusted input: anything on that page (or injected into it) can end up as a
+/// [TERMINAL_EXEC] on the host. These settings are the boundary between the
+/// model's suggestions and the user's machine.
+/// </summary>
+public sealed class SafetySettings
+{
+    /// <summary>Approval policy for terminal commands and file writes. Default: Ask.</summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public ApprovalMode ApprovalMode { get; set; } = ApprovalMode.Ask;
+
+    /// <summary>
+    /// Directory that file writes are confined to. Empty means the process's
+    /// current working directory, resolved at startup.
+    /// </summary>
+    public string WorkspaceRoot { get; set; } = string.Empty;
+
+    /// <summary>Reject file writes that resolve outside <see cref="WorkspaceRoot"/>.</summary>
+    public bool ConfineFileWritesToWorkspace { get; set; } = true;
+
+    /// <summary>
+    /// Convert shell/script markdown code blocks in AI responses into executable
+    /// bracket tokens. Off by default: an AI that merely *explains* a command
+    /// would otherwise have it executed.
+    /// </summary>
+    public bool NormalizeCodeBlocks { get; set; } = false;
+
+    /// <summary>
+    /// Regex patterns that are refused outright, in every mode including Auto.
+    /// Matched case-insensitively against the full command string.
+    /// </summary>
+    public List<string> BlockedCommandPatterns { get; set; } = new()
+    {
+        @"\brm\s+(-[a-z]*\s+)*-[a-z]*[rf][a-z]*\s+[/~]\s*$",   // rm -rf / and rm -rf ~
+        @"\bRemove-Item\b.*\b[A-Za-z]:\\?\s*(-Recurse|$)",      // Remove-Item C:\ -Recurse
+        @"\bformat\s+[A-Za-z]:",                                 // format C:
+        @"\bmkfs(\.[a-z0-9]+)?\b",                               // mkfs.ext4 /dev/sda
+        @"\bdiskpart\b",
+        @"\bdd\s+.*\bof=/dev/",                                  // dd of=/dev/sda
+        @"\bdel\s+/[fsq]\b.*[A-Za-z]:\\",                        // del /f /s /q C:\
+        @"\breg\s+delete\b.*\bHK(LM|EY_LOCAL_MACHINE)\b",
+        @"\bvssadmin\b.*\bdelete\b.*\bshadows\b",                // ransomware-style shadow wipe
+        @"\bcipher\b\s+/w",                                      // free-space wipe
+        @"\b(shutdown|Stop-Computer|Restart-Computer)\b",
+        @"\bSet-ExecutionPolicy\b.*\bUnrestricted\b",
+        @":\(\)\s*\{.*\|.*&.*\}\s*;?\s*:",                       // fork bomb
+        @"\bcurl\b.*\|\s*(sudo\s+)?(ba)?sh\b",                   // curl | sh
+        @"\bwget\b.*\|\s*(sudo\s+)?(ba)?sh\b",
+        @"\bInvoke-(Expression|WebRequest)\b.*\|\s*iex\b"
+    };
+
+    /// <summary>
+    /// Regex patterns considered read-only and auto-approved while in Ask mode,
+    /// so routine inspection does not bury the user in prompts.
+    /// </summary>
+    public List<string> AutoApproveCommandPatterns { get; set; } = new()
+    {
+        @"^\s*(Get-ChildItem|ls|dir)\b",
+        @"^\s*(Get-Content|cat|type)\b",
+        @"^\s*(Get-Location|pwd|cd)\b",
+        @"^\s*git\s+(status|log|diff|branch|show|remote)\b",
+        @"^\s*(dotnet\s+--version|dotnet\s+--info)\b",
+        @"^\s*(echo|Write-Output|Write-Host)\b",
+        @"^\s*(whoami|hostname|date|Get-Date)\b"
+    };
 }
 
 /// <summary>

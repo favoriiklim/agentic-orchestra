@@ -18,17 +18,19 @@ public sealed class ToolExecutionService : IDisposable
     private readonly AppConfig _config;
     private readonly NativeFileService _fileService;
     private readonly NativeTerminalService _terminalService;
+    private readonly SafetyGuard _guard;
     private readonly HttpClient _httpClient;
     private AgentManagerService? _agentManager;
     private PlaywrightWebAgent? _webAgent;
     private int _consecutiveFailures = 0;
     private const int MaxRetryBudget = 5;
 
-    public ToolExecutionService(AppConfig config)
+    public ToolExecutionService(AppConfig config, SafetyGuard? guard = null)
     {
         _config = config;
         _fileService = new NativeFileService();
         _terminalService = new NativeTerminalService();
+        _guard = guard ?? new SafetyGuard(config.Safety);
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
     }
@@ -56,9 +58,11 @@ public sealed class ToolExecutionService : IDisposable
     /// </summary>
     public async Task<ToolExecutionResult> ExecuteToolsAsync(string aiResponse, ManagerTelemetry telemetry, CancellationToken ct = default)
     {
-        // ── Step 0: Normalize markdown code blocks into bracket tokens ──
-        // This makes the system model-agnostic: works with both bracket tokens AND markdown output
-        aiResponse = NormalizeResponse(aiResponse);
+        // ── Step 0: Optionally normalize markdown code blocks into bracket tokens ──
+        // Makes the system model-agnostic, but also turns a code block the AI merely
+        // *explained* into something we execute — so it is opt-in via config.
+        if (_guard.NormalizeCodeBlocks)
+            aiResponse = NormalizeResponse(aiResponse);
 
         bool actionExecuted = false;
         var loopFeedBuilder = new StringBuilder();
@@ -84,6 +88,15 @@ public sealed class ToolExecutionService : IDisposable
             var cmd = m.Groups[1].Value.Trim();
             var dedupKey = $"EXEC:{cmd}";
             if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
+
+            // ── Safety gate ──
+            if (!Authorize(ToolKind.Terminal, cmd, _guard.EvaluateCommand(cmd), out var termRefusal))
+            {
+                loopFeedBuilder.AppendLine($"Result of TERMINAL_EXEC '{cmd}': REFUSED - {termRefusal}");
+                actionExecuted = true;
+                continue;
+            }
+
             var result = await _terminalService.ExecuteCommandAsync(cmd, ct);
             
             // Heuristic error detection
@@ -120,6 +133,16 @@ public sealed class ToolExecutionService : IDisposable
             var content = m.Groups["content"].Value.Trim();
             var dedupKey = $"WRITE:{path}";
             if (!executedCommands.Add(dedupKey)) continue; // Skip duplicate
+
+            // ── Safety gate ──
+            var writeVerdict = _guard.EvaluateFileWrite(path);
+            if (!Authorize(ToolKind.FileWrite, path, writeVerdict, out var writeRefusal, content))
+            {
+                loopFeedBuilder.AppendLine($"Result of FILE_WRITE '{path}': REFUSED - {writeRefusal}");
+                actionExecuted = true;
+                continue;
+            }
+
             var result = _fileService.WriteFile(path, content);
             if (result.Contains("Success"))
             {
@@ -253,6 +276,83 @@ public sealed class ToolExecutionService : IDisposable
 
         return new ToolExecutionResult(loopFeedBuilder.ToString(), actionExecuted, false);
     }
+
+    /// <summary>
+    /// Applies a <see cref="GuardResult"/>, prompting the human when the policy asks for it.
+    /// Returns true when the caller may proceed; otherwise <paramref name="refusal"/>
+    /// carries the message fed back to the AI so it can adapt instead of retrying blindly.
+    /// </summary>
+    private bool Authorize(ToolKind kind, string target, GuardResult verdict, out string refusal, string? preview = null)
+    {
+        refusal = string.Empty;
+
+        switch (verdict.Decision)
+        {
+            case GuardDecision.Allow:
+                return true;
+
+            case GuardDecision.Deny:
+                AnsiConsole.MarkupLine($"[bold red]🛡 BLOCKED[/] [dim]({Markup.Escape(verdict.Reason)})[/]");
+                AnsiConsole.MarkupLine($"[dim red]  {Markup.Escape(Truncate(target, 200))}[/]");
+                refusal = $"Blocked by the host safety policy: {verdict.Reason}. " +
+                          "Do not retry this. Propose a different, safer approach.";
+                return false;
+
+            default:
+                return PromptForApproval(kind, target, verdict, out refusal, preview);
+        }
+    }
+
+    private bool PromptForApproval(ToolKind kind, string target, GuardResult verdict, out string refusal, string? preview)
+    {
+        refusal = string.Empty;
+
+        var label = kind == ToolKind.Terminal ? "run a terminal command" : "write a file";
+        var body = kind == ToolKind.Terminal
+            ? target
+            : $"{target}\n\n{Truncate(preview ?? string.Empty, 600)}";
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.Write(new Panel(new Markup($"[white]{Markup.Escape(Truncate(body, 1200))}[/]"))
+        {
+            Header = new PanelHeader($" 🛡  The AI wants to {label} ", Justify.Left),
+            Border = BoxBorder.Rounded,
+            Padding = new Padding(1, 1, 1, 1)
+        }.BorderColor(Color.Orange1));
+
+        const string once = "✅ Allow once";
+        const string always = "🔓 Allow, and don't ask again this session";
+        const string skip = "⛔ Skip this action (the AI is told and can adapt)";
+        const string abort = "🛑 Skip and cancel the whole task";
+
+        var choice = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title($"[dim]{Markup.Escape(verdict.Reason)}[/] — how should we proceed?")
+                .AddChoices(once, always, skip, abort));
+
+        if (choice == once)
+            return true;
+
+        if (choice == always)
+        {
+            _guard.RememberApproval(kind, target);
+            return true;
+        }
+
+        if (choice == abort)
+        {
+            AnsiConsole.MarkupLine("[bold red]🛑 Task cancelled by user at the approval prompt.[/]");
+            throw new OperationCanceledException("Task cancelled by user at the approval prompt.");
+        }
+
+        AnsiConsole.MarkupLine("[yellow]⛔ Action skipped by user.[/]");
+        refusal = "The human declined this action. Do not repeat it — choose a different approach " +
+                  "or ask the human what they would prefer.";
+        return false;
+    }
+
+    private static string Truncate(string value, int max) =>
+        value.Length <= max ? value : value[..max] + $"… ({value.Length - max} more chars)";
 
     private async Task<string> PerformWebSearchAsync(string query, CancellationToken ct = default)
     {
