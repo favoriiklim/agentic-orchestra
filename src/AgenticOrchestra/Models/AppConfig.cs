@@ -84,6 +84,15 @@ If the middleware replies with a SYNTAX ERROR, read the error carefully, fix you
 /// </summary>
 public sealed class OllamaSettings
 {
+    /// <summary>
+    /// Whether Layer 1 (the local model) participates at all.
+    ///
+    /// Turn this off to run purely on web AIs: the orchestrator skips the local
+    /// probe entirely and talks to the Web Manager directly. Useful when you have
+    /// no Ollama install, no disk space for a model, or simply prefer the web models.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
     /// <summary>Base URL for the Ollama API. Default: http://localhost:11434</summary>
     public string Endpoint { get; set; } = "http://localhost:11434";
 
@@ -99,7 +108,17 @@ public sealed class OllamaSettings
 /// </summary>
 public sealed class WebFallbackSettings
 {
-    /// <summary>Target URL for the web-based AI platform.</summary>
+    /// <summary>
+    /// Name of the platform that plays the Web Manager (Layer 2) role.
+    /// Resolved against <see cref="AppConfig.Platforms"/> by name; this is the
+    /// setting to change when you want the Manager to run on a different site.
+    /// </summary>
+    public string ManagerPlatform { get; set; } = "Gemini";
+
+    /// <summary>
+    /// Target URL for the web-based AI platform. Kept in sync with
+    /// <see cref="ManagerPlatform"/> and used as a fallback when the name does not resolve.
+    /// </summary>
     public string TargetUrl { get; set; } = "https://gemini.google.com/app";
 
     /// <summary>Run the browser in headless mode. Set to false to see the browser window.</summary>

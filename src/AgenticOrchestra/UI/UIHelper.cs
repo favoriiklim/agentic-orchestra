@@ -26,6 +26,25 @@ public static class UIHelper
     }
 
     /// <summary>
+    /// True when there is a real terminal to prompt against.
+    ///
+    /// Spectre throws on any prompt when stdin is redirected, so callers must
+    /// check this before asking a question the app could answer for itself
+    /// (piped input, CI, `orchestra &lt; /dev/null`).
+    /// </summary>
+    public static bool IsInteractive => !Console.IsInputRedirected;
+
+    /// <summary>
+    /// Asks a yes/no question, or silently returns <paramref name="whenNonInteractive"/>
+    /// when there is no terminal to ask.
+    /// </summary>
+    public static bool ConfirmIfInteractive(string question, bool defaultValue, bool whenNonInteractive)
+    {
+        if (!IsInteractive) return whenNonInteractive;
+        return AnsiConsole.Confirm(question, defaultValue);
+    }
+
+    /// <summary>
     /// Renders an approval mode as coloured markup, so the current level of
     /// protection is visible wherever the user is in the app.
     /// </summary>

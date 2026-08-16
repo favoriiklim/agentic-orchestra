@@ -16,8 +16,10 @@ public static class MainMenu
             UIHelper.RenderBanner();
             
             AnsiConsole.Write(new Rule("[dim]Main Menu[/]").LeftJustified());
-            AnsiConsole.MarkupLine($"Current Default Model: [green]{config.Ollama.Model}[/]");
-            AnsiConsole.MarkupLine($"Web Fallback URL: [blue]{config.WebFallback.TargetUrl}[/]");
+            AnsiConsole.MarkupLine(config.Ollama.Enabled
+                ? $"Local AI: [green]{Markup.Escape(config.Ollama.Model)}[/]"
+                : "Local AI: [cyan]off — web-only mode[/]");
+            AnsiConsole.MarkupLine($"Web Manager: [fuchsia]{Markup.Escape(PlaywrightWebAgent.ResolveManagerPlatform(config).Name)}[/] [dim]{Markup.Escape(config.WebFallback.TargetUrl)}[/]");
             AnsiConsole.MarkupLine($"Squad: [cyan]Innovator({config.Squad.InnovatorPlatform})[/] + [cyan]Implementer({config.Squad.ImplementerPlatform})[/] → [yellow]Critic({config.Squad.CriticPlatform})[/]");
             AnsiConsole.MarkupLine($"Dream Threshold: [mediumpurple3]{config.Dreaming.TelemetryThreshold} telemetries[/]");
             AnsiConsole.MarkupLine($"Safety: {UIHelper.DescribeApprovalMode(config.Safety.ApprovalMode)}");
@@ -101,20 +103,26 @@ public static class MainMenu
         UIHelper.RenderBanner();
         AnsiConsole.Write(new Rule("[dim]System Status[/]").LeftJustified());
 
-        var isLocalUp = await AnsiConsole.Status()
-            .StartAsync("Pinging Ollama...", async _ =>
-            {
-                var agent = new OllamaAgent(config);
-                return await agent.IsAvailableAsync();
-            });
+        var health = config.Ollama.Enabled
+            ? await AnsiConsole.Status()
+                .StartAsync("Pinging Ollama...", async _ => await new OllamaAgent(config).CheckHealthAsync())
+            : OllamaHealth.Disabled();
+
+        var layer1Status = !config.Ollama.Enabled
+            ? "[cyan]Off — web-only mode[/]"
+            : health.IsUsable
+                ? "[green]Online[/]"
+                : $"[red]Unavailable[/] [dim]— {Markup.Escape(health.Message)}[/]";
+
+        var managerPlatform = PlaywrightWebAgent.ResolveManagerPlatform(config);
 
         var grid = new Grid()
             .AddColumn(new GridColumn().NoWrap().PadRight(4))
             .AddColumn()
-            .AddRow("[b]Layer 1 (Local AI)[/]", isLocalUp ? "[green]Online[/]" : "[red]Offline — Hard Fallback will activate[/]")
+            .AddRow("[b]Layer 1 (Local AI)[/]", layer1Status)
             .AddRow("[b]Ollama Target[/]", $"[link={config.Ollama.Endpoint}]{config.Ollama.Endpoint}[/]")
-            .AddRow("[b]Ollama Model[/]", config.Ollama.Model)
-            .AddRow("[b]Layer 2 (Web Manager)[/]", $"[link={config.WebFallback.TargetUrl}]{config.WebFallback.TargetUrl}[/]")
+            .AddRow("[b]Ollama Model[/]", Markup.Escape(config.Ollama.Model))
+            .AddRow("[b]Layer 2 (Web Manager)[/]", $"[fuchsia]{Markup.Escape(managerPlatform.Name)}[/] [dim]{Markup.Escape(managerPlatform.Url)}[/]")
             .AddRow("[b]Manager Tab[/]", orchestrator.IsHardFallback ? "[yellow]Fallback Active[/]" : "[dim]Standby[/]")
             .AddRow("[b]Dream Threshold[/]", $"{config.Dreaming.TelemetryThreshold} telemetries")
             .AddRow("[b]Auto Dream on Exit[/]", config.Dreaming.AutoDreamOnExit ? "[green]Enabled[/]" : "[red]Disabled[/]");
@@ -188,19 +196,19 @@ public static class MainMenu
         AnsiConsole.MarkupLine($"[dim]Timeouts: Input={config.Timeouts.InputDetectionSeconds}s | Response={config.Timeouts.ResponseGenerationSeconds}s | Stall={config.Timeouts.StallDetectionSeconds}s | Terminal={config.Timeouts.TerminalCommandSeconds}s[/]");
 
         AnsiConsole.WriteLine();
-        var models = await new OllamaAgent(config).GetModelsAsync();
-        if (models.Any())
+        if (health.InstalledModels.Count > 0)
         {
             AnsiConsole.MarkupLine("[b]Local Models Available:[/]");
-            foreach (var m in models)
+            foreach (var m in health.InstalledModels)
             {
-                var marker = m == config.Ollama.Model ? "[green]*[/]" : " ";
-                AnsiConsole.MarkupLine($" {marker} {m}");
+                var marker = OllamaAgent.ModelMatches(new[] { m }, config.Ollama.Model) ? "[green]*[/]" : " ";
+                AnsiConsole.MarkupLine($" {marker} {Markup.Escape(m)}");
             }
         }
-        else if (isLocalUp)
+        else if (config.Ollama.Enabled && health.ServerUp)
         {
             AnsiConsole.MarkupLine("[yellow]No local models found on this instance.[/]");
+            AnsiConsole.MarkupLine($"[dim]Install one with:[/] ollama pull {Markup.Escape(config.Ollama.Model)}");
         }
 
         AnsiConsole.WriteLine();

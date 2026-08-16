@@ -144,12 +144,8 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
             return existingPage;
         }
 
-        // Determine target URL: platform-specific or default
-        string targetUrl = _config.WebFallback.TargetUrl;
-        if (_agentPlatforms.TryGetValue(agentName, out var platform))
-        {
-            targetUrl = platform.Url;
-        }
+        // Determine target URL: platform-specific, else the resolved Manager platform
+        string targetUrl = GetPlatformForAgent(agentName).Url;
 
         // Ephemeral web chat mode for ChatGPT
         if (_config.WebFallback.EphemeralWebChat && targetUrl.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase))
@@ -217,19 +213,36 @@ public sealed class PlaywrightWebAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Gets the platform config for an agent, falls back to the first enabled platform (Gemini).
+    /// Gets the platform config for an agent, falling back to the configured
+    /// Manager platform and finally to any enabled platform.
     /// </summary>
     private AiPlatformConfig GetPlatformForAgent(string agentName)
     {
         if (_agentPlatforms.TryGetValue(agentName, out var assigned))
             return assigned;
 
-        // Default: find the platform matching TargetUrl, among all platforms (enabled OR disabled)
-        var matchedPlatform = _config.Platforms.FirstOrDefault(p => p.Url == _config.WebFallback.TargetUrl);
-        if (matchedPlatform != null)
-            return matchedPlatform;
+        return ResolveManagerPlatform(_config);
+    }
 
-        return _config.Platforms.FirstOrDefault(p => p.Enabled)
+    /// <summary>
+    /// Resolves which platform plays the Web Manager role.
+    ///
+    /// Name first — that is the setting users actually edit. URL matching is kept
+    /// only so configs written before ManagerPlatform existed keep working.
+    /// </summary>
+    internal static AiPlatformConfig ResolveManagerPlatform(AppConfig config)
+    {
+        var byName = config.Platforms.FirstOrDefault(p =>
+            p.Enabled && p.Name.Equals(config.WebFallback.ManagerPlatform, StringComparison.OrdinalIgnoreCase));
+        if (byName != null)
+            return byName;
+
+        // Legacy configs identified the manager only by its URL.
+        var byUrl = config.Platforms.FirstOrDefault(p => p.Url == config.WebFallback.TargetUrl);
+        if (byUrl != null)
+            return byUrl;
+
+        return config.Platforms.FirstOrDefault(p => p.Enabled)
             ?? AiPlatformConfig.Defaults()[0]; // Ultimate fallback: Gemini
     }
 

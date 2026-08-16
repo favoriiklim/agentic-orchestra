@@ -355,6 +355,10 @@ public sealed record OllamaHealth(
     public bool IsUsable => ServerUp && ModelPresent;
 
     public static OllamaHealth Down(string message) => new(false, false, new List<string>(), message);
+
+    /// <summary>Layer 1 was switched off in config — web-only mode, not a failure.</summary>
+    public static OllamaHealth Disabled() =>
+        new(false, false, new List<string>(), "Local AI is disabled in settings — running web-only.");
 }
 
 // ── Models for internal JSON deserialization ──

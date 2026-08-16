@@ -71,7 +71,10 @@ the action, or cancel the whole task.
 - [.NET 8 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
 - A browser login for at least one of Gemini / ChatGPT / Claude
 - *(Optional)* [Ollama](https://ollama.com/) with a model pulled — `ollama pull llama3.2`.
-  Without it the app runs in hard-fallback mode against the web AI alone.
+
+The local model is genuinely optional. Turn it off under **Settings → Local AI**
+(or leave it off when prompted at startup) and the orchestrator skips Layer 1
+entirely, running **web-only** against the platforms you enabled.
 
 Chromium is downloaded automatically on first run.
 
@@ -155,7 +158,15 @@ talk to the Web Manager directly. Availability is rechecked on every prompt.
 
 ## Configuration
 
-`config.json` is created on first run and editable from the in-app **Settings** menu.
+`config.json` is created on first run and editable from the in-app **Settings** menu,
+which is split into sections so you can change one thing without walking through
+everything else:
+
+`🧠 Local AI` · `🌐 Web Platforms` · `👑 Web Manager` · `👥 Squad Roles` ·
+`🛡 Safety` · `💤 Dreaming` · `⏱ Timeouts` · `📝 System Prompt`
+
+Disabling a platform automatically repoints any role that referenced it, so the
+config never names a site that is switched off.
 
 - **Windows:** `%APPDATA%\AgenticOrchestra\config.json`
 - **Linux/macOS:** `~/.config/AgenticOrchestra/config.json`
@@ -172,9 +183,12 @@ Run `orchestra --config-path` to print the exact location.
 | `safety` | `confineFileWritesToWorkspace` | `true` | Refuse writes outside the workspace. |
 | `safety` | `normalizeCodeBlocks` | `false` | Treat markdown code blocks as executable. |
 | `safety` | `blockedCommandPatterns` | *(see below)* | Regexes refused in every mode. |
+| `ollama` | `enabled` | `true` | Set `false` for web-only mode — Layer 1 is skipped and never probed. |
 | `ollama` | `model` | `llama3.2` | Local model for Layer 1. |
 | `ollama` | `endpoint` | `http://localhost:11434` | Ollama REST endpoint. |
+| `webFallback` | `managerPlatform` | `Gemini` | Which enabled platform hosts the Web Manager (Layer 2). |
 | `webFallback` | `headless` | `false` | Hide the browser window. |
+| `platforms[]` | `enabled` | *(Gemini only)* | Which sites may be used at all. Only enabled sites can host a role. |
 | `squad` | `innovatorPlatform` / `implementerPlatform` / `criticPlatform` | `Gemini` | Which platform plays each role. Point them at different platforms to get genuinely different perspectives. |
 | `squad` | `maxCriticRetries` | `3` | Rework rounds before the Critic is forced to approve. |
 | `dreaming` | `telemetryThreshold` | `10` | Telemetries before a dream cycle triggers. |

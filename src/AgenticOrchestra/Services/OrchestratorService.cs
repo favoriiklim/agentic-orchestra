@@ -64,9 +64,17 @@ public sealed class OrchestratorService : IAsyncDisposable
     {
         get
         {
-            if (IsHardFallback) return "⚠️ Hard Fallback · Web Manager AI (Direct)";
+            var manager = PlaywrightWebAgent.ResolveManagerPlatform(_config).Name;
+
+            if (IsHardFallback)
+            {
+                return _config.Ollama.Enabled
+                    ? $"⚠️ Hard Fallback · {manager} (Direct)"
+                    : $"🌐 Web-Only · {manager} (Direct)";
+            }
+
             if (IsLocalOnly) return $"Ollama · {_config.Ollama.Model}";
-            return $"3-Layer Chain · {_config.Ollama.Model} → Web Manager AI";
+            return $"3-Layer Chain · {_config.Ollama.Model} → {manager}";
         }
     }
 
@@ -117,7 +125,10 @@ public sealed class OrchestratorService : IAsyncDisposable
         try
         {
             // ── Availability Check: can Layer 1 actually serve this? ──
-            var health = await _ollamaAgent.CheckHealthAsync();
+            // Disabled by config means web-only: don't even probe.
+            var health = _config.Ollama.Enabled
+                ? await _ollamaAgent.CheckHealthAsync()
+                : OllamaHealth.Disabled();
 
             if (health.IsUsable)
             {
@@ -208,11 +219,21 @@ public sealed class OrchestratorService : IAsyncDisposable
 
         if (announce && !_webManagerInitialized)
         {
-            AnsiConsole.MarkupLine("[bold yellow]⚠️  HARD FALLBACK MODE: Layer 1 (local AI) is unavailable.[/]");
-            if (!string.IsNullOrWhiteSpace(reason))
-                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(reason)}[/]");
-            AnsiConsole.MarkupLine("[dim]Bypassing Layer 1. Connecting you directly to the Web Manager AI (Layer 2).[/]");
-            AnsiConsole.MarkupLine("[dim]Availability is rechecked on every prompt — normal mode resumes automatically.[/]");
+            if (_config.Ollama.Enabled)
+            {
+                // Unintended: the local model should be helping but cannot.
+                AnsiConsole.MarkupLine("[bold yellow]⚠️  HARD FALLBACK MODE: Layer 1 (local AI) is unavailable.[/]");
+                if (!string.IsNullOrWhiteSpace(reason))
+                    AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(reason)}[/]");
+                AnsiConsole.MarkupLine("[dim]Availability is rechecked on every prompt — normal mode resumes automatically.[/]");
+            }
+            else
+            {
+                // Deliberate: the user chose web-only, so this is not a warning.
+                AnsiConsole.MarkupLine("[bold cyan]🌐 WEB-ONLY MODE — local AI is switched off in settings.[/]");
+            }
+
+            AnsiConsole.MarkupLine("[dim]Connecting you directly to the Web Manager AI (Layer 2).[/]");
             AnsiConsole.WriteLine();
         }
 

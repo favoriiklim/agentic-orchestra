@@ -107,37 +107,59 @@ public static class Program
             // ── Layer 1 health check ────────────────────────────────
             // Surfaced at startup rather than on the first prompt: a running
             // Ollama with no models used to look fine and then fail mid-chat.
-            var ollamaAgent = new OllamaAgent(config);
-            var health = await AnsiConsole.Status()
-                .SpinnerStyle(Style.Parse("magenta"))
-                .StartAsync("[magenta]Checking local AI (Layer 1)...[/]", async _ => await ollamaAgent.CheckHealthAsync());
-
-            if (isFirstRun && health.InstalledModels.Count > 0)
+            if (!config.Ollama.Enabled)
             {
-                var selectedModel = AnsiConsole.Prompt(
-                    new SelectionPrompt<string>()
-                        .Title("Select your preferred default Ollama model:")
-                        .AddChoices(health.InstalledModels));
-
-                config.Ollama.Model = selectedModel;
-                await configService.SaveAsync(config);
-                AnsiConsole.MarkupLine($"[green]Default model set to {selectedModel}.[/]");
-                health = await ollamaAgent.CheckHealthAsync();
-            }
-
-            if (health.IsUsable)
-            {
-                AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [green]ready[/] [dim]({Markup.Escape(config.Ollama.Model)})[/]");
+                AnsiConsole.MarkupLine("[dim]Layer 1:[/] [cyan]off[/] [dim]— web-only mode (change in Settings → Local AI)[/]");
             }
             else
             {
-                AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [yellow]unavailable[/] [dim]— {Markup.Escape(health.Message)}[/]");
-                AnsiConsole.MarkupLine("[dim]The app will run in hard-fallback mode, talking to the web AI directly.[/]");
+                var ollamaAgent = new OllamaAgent(config);
+                var health = await AnsiConsole.Status()
+                    .SpinnerStyle(Style.Parse("magenta"))
+                    .StartAsync("[magenta]Checking local AI (Layer 1)...[/]", async _ => await ollamaAgent.CheckHealthAsync());
 
-                if (health.ServerUp && health.InstalledModels.Count > 0)
+                if (isFirstRun && health.InstalledModels.Count > 0 && UIHelper.IsInteractive)
                 {
-                    AnsiConsole.MarkupLine($"[dim]Installed models:[/] {Markup.Escape(string.Join(", ", health.InstalledModels))}");
-                    AnsiConsole.MarkupLine("[dim]Pick one from Settings to enable the full pipeline.[/]");
+                    var selectedModel = AnsiConsole.Prompt(
+                        new SelectionPrompt<string>()
+                            .Title("Select your preferred default Ollama model:")
+                            .AddChoices(health.InstalledModels));
+
+                    config.Ollama.Model = selectedModel;
+                    await configService.SaveAsync(config);
+                    AnsiConsole.MarkupLine($"[green]Default model set to {selectedModel}.[/]");
+                    health = await ollamaAgent.CheckHealthAsync();
+                }
+
+                if (health.IsUsable)
+                {
+                    AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [green]ready[/] [dim]({Markup.Escape(config.Ollama.Model)})[/]");
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine($"[dim]Layer 1:[/] [yellow]unavailable[/] [dim]— {Markup.Escape(health.Message)}[/]");
+
+                    if (health.InstalledModels.Count > 0)
+                    {
+                        AnsiConsole.MarkupLine($"[dim]Installed models:[/] {Markup.Escape(string.Join(", ", health.InstalledModels))}");
+                        AnsiConsole.MarkupLine("[dim]Pick one in Settings → Local AI to enable the full pipeline.[/]");
+                    }
+
+                    // Local AI is optional — offer to stop asking rather than
+                    // probing a missing Ollama on every single prompt.
+                    if (UIHelper.ConfirmIfInteractive(
+                            "Run in web-only mode from now on (skip the local AI entirely)?",
+                            defaultValue: false,
+                            whenNonInteractive: false))
+                    {
+                        config.Ollama.Enabled = false;
+                        await configService.SaveAsync(config);
+                        AnsiConsole.MarkupLine("[cyan]Web-only mode enabled. Re-enable it any time in Settings → Local AI.[/]");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine("[dim]Continuing in hard-fallback mode: prompts go straight to the web AI.[/]");
+                    }
                 }
             }
             AnsiConsole.WriteLine();
