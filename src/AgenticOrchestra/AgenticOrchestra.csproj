@@ -11,7 +11,21 @@
       <PackAsTool>true</PackAsTool>
       <ToolCommandName>orchestra</ToolCommandName>
       <Version>1.0.0</Version>
+
+      <!-- Package metadata, so the tool is identifiable on NuGet. -->
+      <Description>A cross-platform CLI orchestrator that drives local (Ollama) and web-based AIs as a single hierarchical team, with an approval gate over every action that touches the machine.</Description>
+      <PackageTags>ai;cli;orchestrator;ollama;llm;playwright;agents</PackageTags>
+      <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+      <PackageReadmeFile>README.md</PackageReadmeFile>
+
+      <!-- NU5111: Playwright ships helper .ps1 scripts whose names NuGet does not
+           recognise. They are payload, never install hooks, so the warning is noise. -->
+      <NoWarn>$(NoWarn);NU5111</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.49.*" />

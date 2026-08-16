@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore AgenticOrchestra.sln
+
+      # Warnings are treated as errors so the build stays clean, and a stray
+      # merge-conflict marker (CS8300) can never reach main again.
+      - name: Build
+        run: dotnet build AgenticOrchestra.sln --configuration Release --no-restore -warnaserror
+
+      - name: Test
+        run: dotnet test AgenticOrchestra.sln --configuration Release --no-build --verbosity normal
+
+  guard:
+    name: Repository guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject unresolved merge conflict markers
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> |=======$)' -- '*.cs' '*.csproj' '*.md' '*.yml'; then
+            echo "::error::Unresolved merge conflict markers found."
+            exit 1
+          fi
+          echo "No conflict markers found."
+
+      - name: Verify the tool packs
+        run: |
+          dotnet pack src/AgenticOrchestra/AgenticOrchestra.csproj \
+            --configuration Release --output ./artifacts
+          ls -la ./artifacts
